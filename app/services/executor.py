@@ -1,4 +1,5 @@
 import httpx
+import re
 from datetime import datetime, timezone
 from app.config import settings
 from app.database import supabase
@@ -8,9 +9,54 @@ from app.database import supabase
 
 async def get_user_integrations(user_id: str) -> dict:
     result = supabase.table("user_settings").select(
-        "github_token, selected_repo_full_name, slack_webhook_url, notion_token, linear_token"
+        "github_token, selected_repo_full_name, slack_webhook_url, notion_token, linear_token, jira_token, jira_domain"
     ).eq("user_id", user_id).execute()
     return result.data[0] if result.data else {}
+
+
+# ── Email executor ────────────────────────────────────────────────
+
+async def _execute_email(node_data: dict, context: dict) -> str:
+    label = node_data.get("label", "")
+    description = node_data.get("description", "")
+    parent_output = "\n".join(context.get("parent_outputs", []))
+    
+    # Extract email from label or description
+    text = f"{label} {description}"
+    match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', text)
+    if not match:
+        raise Exception("No email address found in node. Add an email like 'notify team@company.com'")
+        
+    to_email = match.group(0)
+    body = parent_output or description or f"DevFlow pipeline step '{label}' completed."
+    
+    async with httpx.AsyncClient() as client:
+        res = await client.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {settings.RESEND_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "from": "DevFlow <notifications@devflow.ai>",
+                "to": [to_email],
+                "subject": f"DevFlow Pipeline: {label}",
+                "html": f"""
+                <div style="font-family:monospace;background:#080808;color:#F1F5F9;padding:24px;border-radius:12px;">
+                    <h2 style="color:#6EE7B7;margin-bottom:16px;">⚡ DevFlow Pipeline Notification</h2>
+                    <p style="color:#64748B;font-size:12px;">Step: <strong style="color:#F1F5F9">{label}</strong></p>
+                    <div style="background:#111;border:1px solid #222;border-radius:8px;padding:16px;margin-top:12px;">
+                        <pre style="color:#F1F5F9;font-size:12px;white-space:pre-wrap;">{body}</pre>
+                    </div>
+                    <p style="color:#333;font-size:10px;margin-top:16px;">Sent by DevFlow AI · devflow.ai</p>
+                </div>
+                """
+            },
+            timeout=10.0
+        )
+        if res.status_code in [200, 201]:
+            return f"Email sent to {to_email}"
+        raise Exception(f"Email failed: {res.json().get('message', res.status_code)}")
 
 
 # ── Main executor ─────────────────────────────────────────────────
@@ -100,8 +146,12 @@ async def _execute_node(node_type: str, node_data: dict, user_id: str, integrati
     elif node_type == "ai":
         return await _execute_ai(node_data, context, integrations)
 
-    elif node_type == "action":
-        if any(k in label for k in ["github", "commit", "push", "pr", "pull request", "branch", "repo"]) or icon in ["git-branch", "github"]:
+    elif node_type == "action" or node_type == "notification":
+        # Check email specifically
+        if "mail" in icon or "email" in label or "@" in label or "@" in description:
+            return await _execute_email(node_data, context)
+            
+        elif any(k in label for k in ["github", "commit", "push", "pr", "pull request", "branch", "repo"]) or icon in ["git-branch", "github"]:
             return await _execute_github(node_data, integrations, context)
         elif any(k in label for k in ["slack", "notify", "notification", "message", "alert"]) or icon in ["bell", "slack"]:
             return await _execute_slack(node_data, integrations, context)
@@ -109,11 +159,10 @@ async def _execute_node(node_type: str, node_data: dict, user_id: str, integrati
             return await _execute_notion(node_data, integrations, context)
         elif any(k in label for k in ["linear", "issue", "ticket"]):
             return await _execute_linear(node_data, integrations, context)
+        elif any(k in label for k in ["jira", "ticket", "atlassian"]):
+            return await _execute_jira(node_data, integrations, context)
         else:
             return f"Action '{node_data.get('label')}' executed"
-
-    elif node_type == "notification":
-        return await _execute_slack(node_data, integrations, context)
 
     return f"Step '{node_data.get('label')}' completed"
 
@@ -275,3 +324,45 @@ async def _execute_linear(node_data: dict, integrations: dict, context: dict) ->
         if issue:
             return f"Linear issue created: {issue.get('title')} — {issue.get('url', '')}"
         raise Exception("Linear issue creation failed")
+
+# ── Jira executor ─────────────────────────────────────────────────
+async def _execute_jira(node_data: dict, integrations: dict, context: dict) -> str:
+    token = integrations.get("jira_token")
+    domain = integrations.get("jira_domain")
+    
+    if not token or not domain:
+        raise Exception("Jira not connected. Go to Integrations → Connect Jira.")
+        
+    import base64
+    label = node_data.get("label", "Issue")
+    description = node_data.get("description", "") or "\n".join(context.get("parent_outputs", []))
+    
+    # Get first project key
+    async with httpx.AsyncClient() as client:
+        auth = base64.b64encode(f"devflow:{token}".encode()).decode()
+        headers = {"Authorization": f"Basic {auth}", "Content-Type": "application/json"}
+        
+        r = await client.get(f"https://{domain}/rest/api/3/project?maxResults=1", headers=headers, timeout=10.0)
+        r.raise_for_status()
+        projects = r.json()
+        
+        project_list = projects if isinstance(projects, list) else projects.get("values", [])
+        
+        if not project_list:
+            raise Exception("No Jira projects found.")
+            
+        project_key = project_list[0]["key"]
+        
+        res = await client.post(f"https://{domain}/rest/api/3/issue", headers=headers,
+            json={"fields": {
+                "project": {"key": project_key},
+                "summary": label,
+                "description": {"type": "doc", "version": 1, "content": [
+                    {"type": "paragraph", "content": [{"type": "text", "text": description or label}]}
+                ]},
+                "issuetype": {"name": "Task"}
+            }}, timeout=10.0)
+        res.raise_for_status()
+        issue = res.json()
+        
+        return f"Jira issue created: {issue['key']} — https://{domain}/browse/{issue['key']}"
