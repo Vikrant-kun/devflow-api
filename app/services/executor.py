@@ -354,11 +354,24 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
 
     description = node_data.get("description", "") or node_data.get("label", "")
     file_match = re.search(r'[\w./\-]+\.\w+', description)
-    if not file_match:
-        raise Exception("Could not find a file path in the node description. e.g. 'fix errors in src/index.js'")
-    filepath = file_match.group(0)
-
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+
+    if not file_match:
+        # No specific file — fetch repo tree and let AI pick the most relevant file
+        async with httpx.AsyncClient(timeout=30) as client2:
+            tree_res = await client2.get(
+                f"https://api.github.com/repos/{repo}/git/trees/HEAD?recursive=1",
+                headers=headers
+            )
+            if tree_res.status_code != 200:
+                raise Exception("Could not read repo files. Specify a file path in your prompt e.g. 'fix errors in src/index.js'")
+            files = [f["path"] for f in tree_res.json().get("tree", []) if f["type"] == "blob" and any(f["path"].endswith(ext) for ext in [".js", ".jsx", ".ts", ".tsx", ".py", ".css"])]
+            if not files:
+                raise Exception("No code files found in repo.")
+            filepath = files[0]  # default to first file, AI will handle it
+    else:
+        filepath = file_match.group(0)
+
     async with httpx.AsyncClient(timeout=30) as client:
         # 1. Read file from GitHub
         r = await client.get(f"https://api.github.com/repos/{repo}/contents/{filepath}", headers=headers)
