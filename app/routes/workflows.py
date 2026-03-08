@@ -11,7 +11,6 @@ from app.config import settings
 router = APIRouter(prefix="/workflows", tags=["workflows"])
 
 
-# ── GET /workflows — list all user's workflows ───────────────────
 @router.get("/")
 async def list_workflows(user: dict = Depends(get_current_user)):
     result = (
@@ -24,7 +23,6 @@ async def list_workflows(user: dict = Depends(get_current_user)):
     return {"workflows": result.data}
 
 
-# ── GET /workflows/:id ───────────────────────────────────────────
 @router.get("/{workflow_id}")
 async def get_workflow(workflow_id: str, user: dict = Depends(get_current_user)):
     result = (
@@ -32,15 +30,13 @@ async def get_workflow(workflow_id: str, user: dict = Depends(get_current_user))
         .select("*")
         .eq("id", workflow_id)
         .eq("user_id", user["user_id"])
-        .single()
         .execute()
     )
     if not result.data:
         raise HTTPException(status_code=404, detail="Workflow not found")
-    return result.data
+    return result.data[0]
 
 
-# ── POST /workflows — save/create workflow ───────────────────────
 @router.post("/")
 async def save_workflow(
     body: SaveWorkflowRequest,
@@ -55,14 +51,13 @@ async def save_workflow(
             "edges": body.edges,
             "status": body.status or "draft"
         })
-        .select()
-        .single()
         .execute()
     )
-    return result.data
+    if not result.data:
+        raise HTTPException(status_code=500, detail="Failed to save workflow")
+    return result.data[0]
 
 
-# ── PUT /workflows/:id — update workflow ─────────────────────────
 @router.put("/{workflow_id}")
 async def update_workflow(
     workflow_id: str,
@@ -79,16 +74,13 @@ async def update_workflow(
         })
         .eq("id", workflow_id)
         .eq("user_id", user["user_id"])
-        .select()
-        .single()
         .execute()
     )
     if not result.data:
         raise HTTPException(status_code=404, detail="Workflow not found")
-    return result.data
+    return result.data[0]
 
 
-# ── DELETE /workflows/:id ────────────────────────────────────────
 @router.delete("/{workflow_id}")
 async def delete_workflow(
     workflow_id: str,
@@ -98,20 +90,17 @@ async def delete_workflow(
     return {"deleted": True}
 
 
-# ── POST /workflows/run — execute pipeline + save snapshot ───────
 @router.post("/run")
 async def run_workflow(
     body: RunWorkflowRequest,
     user: dict = Depends(get_current_user)
 ):
-    # Execute the workflow
     result = await execute_workflow(
         nodes=body.snapshot.nodes,
         edges=body.snapshot.edges,
         user_id=user["user_id"]
     )
 
-    # Save run to workflow_runs with full snapshot for replay
     run_data = {
         "user_id": user["user_id"],
         "workflow_id": body.workflow_id,
@@ -120,21 +109,20 @@ async def run_workflow(
         "started_at": result["started_at"],
         "duration": result["duration"],
         "triggered_by": "manual",
-        "snapshot": body.snapshot.model_dump(),  # full node/edge state saved here
+        "snapshot": body.snapshot.model_dump(),
         "logs": result["logs"]
     }
 
-    run_result = supabase.table("workflow_runs").insert(run_data).select().single().execute()
+    run_result = supabase.table("workflow_runs").insert(run_data).execute()
 
     return {
-        "run_id": run_result.data["id"],
+        "run_id": run_result.data[0]["id"] if run_result.data else None,
         "status": result["status"],
         "duration": result["duration"],
         "logs": result["logs"]
     }
 
 
-# ── POST /workflows/generate — generate via Groq ─────────────────
 @router.post("/generate")
 async def generate_workflow(
     body: GenerateWorkflowRequest,
