@@ -342,6 +342,7 @@ async def _execute_ai(node_data: dict, context: dict, integrations: dict) -> str
     description = node_data.get("description", "")
     label = node_data.get("label", "AI Step")
     parent_output = "\n".join(context.get("parent_outputs", []))
+    model = node_data.get("model", "groq")  # default groq
 
     prompt = f"""You are an AI step in a workflow pipeline.
 Previous step output: {parent_output or 'None'}
@@ -349,16 +350,37 @@ Your task: {description or label}
 Respond with a concise, actionable result (2-4 sentences max)."""
 
     async with httpx.AsyncClient() as client:
-        res = await client.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {settings.GROQ_API_KEY}"},
-            json={"model": "llama-3.3-70b-versatile",
-                  "messages": [{"role": "user", "content": prompt}],
-                  "max_tokens": 300},
-            timeout=20.0
-        )
-        res.raise_for_status()
-        return res.json()["choices"][0]["message"]["content"].strip()
+
+        if model == "gpt4" and settings.OPENAI_API_KEY:
+            res = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {settings.OPENAI_API_KEY}"},
+                json={"model": "gpt-4o", "messages": [{"role": "user", "content": prompt}], "max_tokens": 300},
+                timeout=20.0
+            )
+            res.raise_for_status()
+            return res.json()["choices"][0]["message"]["content"].strip()
+
+        elif model == "gemini" and settings.GEMINI_API_KEY:
+            res = await client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={settings.GEMINI_API_KEY}",
+                headers={"Content-Type": "application/json"},
+                json={"contents": [{"parts": [{"text": prompt}]}]},
+                timeout=20.0
+            )
+            res.raise_for_status()
+            return res.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+        else:
+            # Default — Groq
+            res = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {settings.GROQ_API_KEY}"},
+                json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": prompt}], "max_tokens": 300},
+                timeout=20.0
+            )
+            res.raise_for_status()
+            return res.json()["choices"][0]["message"]["content"].strip()
 
 
 # ── Slack executor ────────────────────────────────────────────────
