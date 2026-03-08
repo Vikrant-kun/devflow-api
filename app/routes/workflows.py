@@ -1,3 +1,5 @@
+import json
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from app.auth import get_current_user
 from app.database import supabase
@@ -5,7 +7,6 @@ from app.models.workflow import (
     SaveWorkflowRequest, RunWorkflowRequest, GenerateWorkflowRequest
 )
 from app.services.executor import execute_workflow
-import httpx
 from app.config import settings
 
 router = APIRouter(prefix="/workflows", tags=["workflows"])
@@ -95,11 +96,14 @@ async def run_workflow(
     body: RunWorkflowRequest,
     user: dict = Depends(get_current_user)
 ):
+    # Safely extract prompt from snapshot model
+    prompt_val = getattr(body.snapshot, "prompt", "")
+
     result = await execute_workflow(
         nodes=body.snapshot.nodes,
         edges=body.snapshot.edges,
         user_id=user["user_id"],
-        context={"prompt": body.snapshot.prompt if hasattr(body.snapshot, "prompt") else ""}
+        context={"prompt": prompt_val}
     )
 
     run_data = {
@@ -158,7 +162,6 @@ Rules: first node always trigger, max 8 nodes, labels 2-4 words."""
     data = res.json()
     raw = data["choices"][0]["message"]["content"].replace("```json", "").replace("```", "").strip()
 
-    import json
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
