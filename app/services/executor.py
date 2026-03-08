@@ -133,7 +133,102 @@ async def execute_workflow(nodes: list, edges: list, user_id: str, context: dict
     }
 
 
-# ── Node router ───────────────────────────────────────────────────
+# ── WebSocket-aware executor (streams node updates in real time) ───
+
+async def execute_workflow_ws(
+    nodes: list,
+    edges: list,
+    user_id: str,
+    context: dict = {},
+    on_node_complete=None
+) -> dict:
+    start = datetime.now(timezone.utc)
+    logs = []
+    status = "success"
+    integrations = await get_user_integrations(user_id)
+
+    # Topological sort (same as execute_workflow)
+    node_map = {n["id"]: n for n in nodes}
+    adj = {n["id"]: [] for n in nodes}
+    for edge in edges:
+        adj[edge["source"]].append(edge["target"])
+
+    has_incoming = {e["target"] for e in edges}
+    roots = [n["id"] for n in nodes if n["id"] not in has_incoming]
+    if not roots:
+        roots = [nodes[0]["id"]] if nodes else []
+
+    visited, queue, seen = [], list(roots), set()
+    while queue:
+        nid = queue.pop(0)
+        if nid in seen:
+            continue
+        seen.add(nid)
+        visited.append(nid)
+        queue.extend(adj.get(nid, []))
+
+    node_outputs = {}
+
+    for nid in visited:
+        node = node_map.get(nid)
+        if not node:
+            continue
+        node_data = node.get("data", {})
+        node_type = node_data.get("type", node.get("type", "action"))
+        label = node_data.get("label", "Unknown Step")
+
+        # Send "running" status before execution
+        if on_node_complete:
+            await on_node_complete({
+                "node_id": nid,
+                "node_label": label,
+                "type": node_type,
+                "status": "running",
+                "message": "Executing...",
+                "duration": None,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            })
+
+        parent_outputs = [node_outputs[e["source"]] for e in edges if e["target"] == nid and e["source"] in node_outputs]
+        node_context = {**context, "parent_outputs": parent_outputs}
+
+        t_start = datetime.now(timezone.utc)
+        try:
+            result = await _execute_node(node_type, node_data, user_id, integrations, node_context)
+            node_outputs[nid] = result
+            duration = f"{(datetime.now(timezone.utc) - t_start).total_seconds():.1f}s"
+            log_entry = {
+                "node_id": nid, "node_label": label, "type": node_type,
+                "status": "success", "message": result, "duration": duration,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+            logs.append(log_entry)
+            if on_node_complete:
+                await on_node_complete(log_entry)
+        except Exception as e:
+            status = "failed"
+            duration = f"{(datetime.now(timezone.utc) - t_start).total_seconds():.1f}s"
+            log_entry = {
+                "node_id": nid, "node_label": label, "type": node_type,
+                "status": "failed", "message": str(e), "duration": duration,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+            logs.append(log_entry)
+            if on_node_complete:
+                await on_node_complete(log_entry)
+            break
+
+    end = datetime.now(timezone.utc)
+    secs = (end - start).total_seconds()
+    return {
+        "status": status,
+        "duration": f"{int(secs // 60)}m {int(secs % 60)}s" if secs >= 60 else f"{secs:.1f}s",
+        "logs": logs,
+        "started_at": start.isoformat(),
+        "finished_at": end.isoformat()
+    }
+
+
 
 async def _execute_node(node_type: str, node_data: dict, user_id: str, integrations: dict, context: dict) -> str:
     label = node_data.get("label", "step").lower()
@@ -366,3 +461,87 @@ async def _execute_jira(node_data: dict, integrations: dict, context: dict) -> s
         issue = res.json()
         
         return f"Jira issue created: {issue['key']} — https://{domain}/browse/{issue['key']}"
+
+# ── WebSocket executor (same as execute_workflow but streams node updates) ────
+
+async def execute_workflow_ws(nodes: list, edges: list, user_id: str, context: dict = {}, on_node_complete=None) -> dict:
+    start = datetime.now(timezone.utc)
+    logs = []
+    status = "success"
+    integrations = await get_user_integrations(user_id)
+
+    node_map = {n["id"]: n for n in nodes}
+    adj = {n["id"]: [] for n in nodes}
+    for edge in edges:
+        adj[edge["source"]].append(edge["target"])
+
+    has_incoming = {e["target"] for e in edges}
+    roots = [n["id"] for n in nodes if n["id"] not in has_incoming]
+    if not roots:
+        roots = [nodes[0]["id"]] if nodes else []
+
+    visited, queue, seen = [], list(roots), set()
+    while queue:
+        nid = queue.pop(0)
+        if nid in seen:
+            continue
+        seen.add(nid)
+        visited.append(nid)
+        queue.extend(adj.get(nid, []))
+
+    node_outputs = {}
+
+    for nid in visited:
+        node = node_map.get(nid)
+        if not node:
+            continue
+        node_data = node.get("data", {})
+        node_type = node_data.get("type", node.get("type", "action"))
+        label = node_data.get("label", "Unknown Step")
+
+        parent_outputs = [node_outputs[e["source"]] for e in edges if e["target"] == nid and e["source"] in node_outputs]
+        node_context = {**context, "parent_outputs": parent_outputs}
+
+        # Send "running" status before executing
+        if on_node_complete:
+            await on_node_complete({
+                "node_id": nid, "node_label": label, "type": node_type,
+                "status": "running", "message": "Executing...",
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            })
+
+        t_start = datetime.now(timezone.utc)
+        try:
+            result = await _execute_node(node_type, node_data, user_id, integrations, node_context)
+            node_outputs[nid] = result
+            duration = f"{(datetime.now(timezone.utc) - t_start).total_seconds():.1f}s"
+            log_entry = {
+                "node_id": nid, "node_label": label, "type": node_type,
+                "status": "success", "message": result, "duration": duration,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+            logs.append(log_entry)
+            if on_node_complete:
+                await on_node_complete(log_entry)
+        except Exception as e:
+            status = "failed"
+            duration = f"{(datetime.now(timezone.utc) - t_start).total_seconds():.1f}s"
+            log_entry = {
+                "node_id": nid, "node_label": label, "type": node_type,
+                "status": "failed", "message": str(e), "duration": duration,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+            logs.append(log_entry)
+            if on_node_complete:
+                await on_node_complete(log_entry)
+            break
+
+    end = datetime.now(timezone.utc)
+    secs = (end - start).total_seconds()
+    return {
+        "status": status,
+        "duration": f"{int(secs // 60)}m {int(secs % 60)}s" if secs >= 60 else f"{secs:.1f}s",
+        "logs": logs,
+        "started_at": start.isoformat(),
+        "finished_at": end.isoformat()
+    }
