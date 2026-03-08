@@ -21,13 +21,14 @@ async def _execute_email(node_data: dict, context: dict) -> str:
     description = node_data.get("description", "")
     parent_output = "\n".join(context.get("parent_outputs", []))
     
-    # Extract email from label or description
-    text = f"{label} {description}"
-    match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', text)
-    if not match:
-        raise Exception("No email address found in node. Add an email like 'notify team@company.com'")
-        
-    to_email = match.group(0)
+    # Check explicit email field first, then scan label/description
+    to_email = node_data.get("email", "")
+    if not to_email:
+        text = f"{label} {description}"
+        match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', text)
+        if not match:
+            raise Exception("No email address found. Add an email in the node config panel.")
+        to_email = match.group(0)
     body = parent_output or description or f"DevFlow pipeline step '{label}' completed."
     
     async with httpx.AsyncClient() as client:
@@ -243,7 +244,8 @@ async def _execute_node(node_type: str, node_data: dict, user_id: str, integrati
 
     elif node_type == "action" or node_type == "notification":
         # Check email specifically
-        if "mail" in icon or "email" in label or "@" in label or "@" in description:
+        node_email = node_data.get("email", "")
+        if "mail" in icon or "email" in label or "@" in label or "@" in description or "@" in node_email:
             return await _execute_email(node_data, context)
             
         elif any(k in label for k in ["github", "commit", "push", "pr", "pull request", "branch", "repo"]) or icon in ["git-branch", "github"]:
