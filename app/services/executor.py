@@ -248,6 +248,9 @@ async def _execute_node(node_type: str, node_data: dict, user_id: str, integrati
         if "mail" in icon or "email" in label or "@" in label or "@" in description or "@" in node_email:
             return await _execute_email(node_data, context)
             
+        elif any(k in label for k in ["fix", "edit", "refactor", "improve", "debug"]) or (any(k in label for k in ["push", "commit"]) and any(k in label for k in ["main", "branch", "code"])):
+            return await _execute_ai_code_edit(node_data, integrations, context)
+
         elif any(k in label for k in ["github", "commit", "push", "pr", "pull request", "branch", "repo"]) or icon in ["git-branch", "github"]:
             return await _execute_github(node_data, integrations, context)
         elif any(k in label for k in ["slack", "notify", "notification", "message", "alert"]) or icon in ["bell", "slack"]:
@@ -336,6 +339,76 @@ async def _execute_github(node_data: dict, integrations: dict, context: dict) ->
                 issue = r.json()
                 return f"Issue #{issue['number']} created: {issue['html_url']}"
             raise Exception(f"GitHub API error: {r.json().get('message', r.status_code)}")
+
+
+# ── AI Code Edit executor ────────────────────────────────────────────────────
+
+async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: dict) -> str:
+    import re
+    import base64 as b64
+
+    token = integrations.get("github_token")
+    repo = integrations.get("selected_repo_full_name")
+    if not token or not repo:
+        raise Exception("GitHub not connected or no repo selected.")
+
+    description = node_data.get("description", "") or node_data.get("label", "")
+    file_match = re.search(r'[\w./\-]+\.\w+', description)
+    if not file_match:
+        raise Exception("Could not find a file path in the node description. e.g. 'fix errors in src/index.js'")
+    filepath = file_match.group(0)
+
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    async with httpx.AsyncClient(timeout=30) as client:
+        # 1. Read file from GitHub
+        r = await client.get(f"https://api.github.com/repos/{repo}/contents/{filepath}", headers=headers)
+        if r.status_code != 200:
+            raise Exception(f"Could not read {filepath} from {repo}: {r.json().get('message', r.status_code)}")
+
+        file_data = r.json()
+        original_content = b64.b64decode(file_data["content"]).decode("utf-8")
+        sha = file_data["sha"]
+
+        # 2. Send to AI for fixing
+        from app.config import settings
+        ai_prompt = (
+            f"Fix all errors, bugs, and issues in this code. "
+            f"Return ONLY the fixed code, no explanations, no markdown.\n\nFile: {filepath}\n\n{original_content}"
+        )
+        groq_res = await client.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": [{"role": "user", "content": ai_prompt}],
+                "max_tokens": 4096,
+                "temperature": 0.2
+            }
+        )
+        if groq_res.status_code != 200:
+            raise Exception(f"AI request failed: {groq_res.status_code}")
+
+        fixed_code = groq_res.json()["choices"][0]["message"]["content"]
+        # Strip markdown code fences if AI added them
+        fixed_code = re.sub(r'^```[\w]*\n?', '', fixed_code.strip())
+        fixed_code = re.sub(r'\n?```$', '', fixed_code)
+
+        # 3. Commit fixed file back
+        encoded = b64.b64encode(fixed_code.encode("utf-8")).decode("utf-8")
+        commit_res = await client.put(
+            f"https://api.github.com/repos/{repo}/contents/{filepath}",
+            headers=headers,
+            json={
+                "message": f"DevFlow AI: fix errors in {filepath}",
+                "content": encoded,
+                "sha": sha,
+                "branch": "main"
+            }
+        )
+        if commit_res.status_code not in (200, 201):
+            raise Exception(f"Commit failed: {commit_res.json().get('message', commit_res.status_code)}")
+
+        return f"✅ Fixed and committed {filepath} to {repo}/main"
 
 
 # ── AI executor ───────────────────────────────────────────────────
