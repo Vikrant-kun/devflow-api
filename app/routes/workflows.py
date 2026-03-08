@@ -98,7 +98,8 @@ async def run_workflow(
     result = await execute_workflow(
         nodes=body.snapshot.nodes,
         edges=body.snapshot.edges,
-        user_id=user["user_id"]
+        user_id=user["user_id"],
+        context={"prompt": body.snapshot.prompt if hasattr(body.snapshot, "prompt") else ""}
     )
 
     run_data = {
