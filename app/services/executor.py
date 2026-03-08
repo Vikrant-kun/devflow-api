@@ -194,6 +194,13 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
 
         encoded = b64.b64encode(fixed_code.encode("utf-8")).decode("utf-8")
 
+        # Get default branch first
+        branch_res = await client.get(
+            f"https://api.github.com/repos/{repo}",
+            headers=headers
+        )
+        default_branch = branch_res.json().get("default_branch", "main") if branch_res.status_code == 200 else "main"
+
         commit_res = await client.put(
             f"https://api.github.com/repos/{repo}/contents/{selected_path}",
             headers=headers,
@@ -201,14 +208,14 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
                 "message": f"DevFlow AI: improved/fixed {selected_path}",
                 "content": encoded,
                 "sha": sha,
-                "branch": "main"
+                "branch": default_branch
             }
         )
 
         if commit_res.status_code not in (200, 201):
             raise Exception(f"Commit failed: {commit_res.json().get('message', commit_res.status_code)}")
 
-        return f"✅ Fixed & committed changes to {selected_path} in {repo}/main"
+        return f"✅ Fixed and committed {selected_path} to {repo}/{default_branch}"
 
 
 # ── Main node dispatcher ──────────────────────────────────────────
