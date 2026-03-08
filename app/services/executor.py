@@ -39,7 +39,7 @@ async def _execute_email(node_data: dict, context: dict) -> str:
                 "Content-Type": "application/json"
             },
             json={
-                "from": "DevFlow <notifications@devflow.ai>",
+                "from": "DevFlow <onboarding@resend.dev>",
                 "to": [to_email],
                 "subject": f"DevFlow Pipeline: {label}",
                 "html": f"""
