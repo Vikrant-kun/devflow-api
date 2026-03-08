@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
-from app.routes import workflows, runs, health
+from app.routes import workflows, runs, health, github
 
 app = FastAPI(
     title="DevFlow API",
@@ -29,3 +29,4 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(workflows.router)
 app.include_router(runs.router)
+app.include_router(github.router)
