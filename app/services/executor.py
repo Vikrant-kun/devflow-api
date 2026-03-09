@@ -238,7 +238,7 @@ async def _execute_node(node_type: str, node_data: dict, user_id: str, integrati
             return await _execute_email(node_data, context)
 
         # Code edit / fix / refactor detection
-        elif any(k in label for k in ["fix", "edit", "refactor", "improve", "debug", "clean", "lint", "error", "bug"]):
+        elif any(k in label for k in ["fix", "edit", "refactor", "improve", "debug", "error", "finder", "check", "scan", "review", "clean", "lint", "bug"]) or (any(k in label for k in ["push", "commit"]) and any(k in label for k in ["main", "branch", "code"])):
             return await _execute_ai_code_edit(node_data, integrations, context)
 
         # Generic GitHub actions
