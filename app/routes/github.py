@@ -316,3 +316,52 @@ async def select_repo(body: dict, user: dict = Depends(get_current_user)):
         "updated_at": datetime.utcnow().isoformat()
     }, on_conflict="user_id").execute()
     return {"saved": True}
+
+
+class BranchInfo(BaseModel):
+    name: str
+    commit_sha: str
+    protected: bool
+    is_default: bool
+
+@router.get("/branches")
+async def list_branches(user: dict = Depends(get_current_user)):
+    token = get_github_token(user)
+    result = (
+        supabase.table("user_settings")
+        .select("selected_repo_full_name")
+        .eq("user_id", user["user_id"])
+        .execute()
+    )
+    if not result.data or not result.data[0].get("selected_repo_full_name"):
+        raise HTTPException(status_code=400, detail="No repository selected.")
+    repo_full_name = result.data[0]["selected_repo_full_name"]
+    async with httpx.AsyncClient() as client:
+        repo_res = await client.get(
+            f"https://api.github.com/repos/{repo_full_name}",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+            timeout=10.0
+        )
+        if repo_res.status_code != 200:
+            raise HTTPException(status_code=repo_res.status_code, detail=f"GitHub API error: {repo_res.text}")
+        default_branch = repo_res.json().get("default_branch")
+
+        branches_res = await client.get(
+            f"https://api.github.com/repos/{repo_full_name}/branches?per_page=100",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+            timeout=12.0
+        )
+        if branches_res.status_code != 200:
+            raise HTTPException(status_code=branches_res.status_code, detail=f"Failed to fetch branches: {branches_res.text}")
+
+        branches = [
+            {
+                "name": b["name"],
+                "commit_sha": b["commit"]["sha"],
+                "protected": b.get("protected", False),
+                "is_default": b["name"] == default_branch
+            }
+            for b in branches_res.json()
+        ]
+        branches.sort(key=lambda x: (not x["is_default"], x["name"]))
+        return {"repo": repo_full_name, "branches": branches, "default_branch": default_branch, "total": len(branches)}
