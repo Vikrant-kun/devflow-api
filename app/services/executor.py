@@ -73,18 +73,15 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
     description = (node_data.get("description") or node_data.get("label") or "").strip()
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
 
-    # ── Step 1: Try to extract explicit file path from description/label ──
+    # Try to extract explicit file path
     file_match = re.search(r'(?:file|path|fix|edit|in|at)\s*:\s*([a-zA-Z0-9_/.-]+\.[a-zA-Z0-9]+)', description, re.IGNORECASE)
     if not file_match:
         file_match = re.search(r'[a-zA-Z0-9_/.-]+\.(?:py|js|jsx|ts|tsx|css|html|json|md|yaml|yml|java|go|rs|cpp|c|h)', description)
 
-    if file_match:
-        filepath = file_match.group(0).strip()
-    else:
-        filepath = None
+    filepath = file_match.group(0).strip() if file_match else None
 
     async with httpx.AsyncClient(timeout=45.0) as client:
-        # ── Step 2: Get file tree ───────────────────────────────────────
+        # Get file tree
         tree_res = await client.get(
             f"https://api.github.com/repos/{repo}/git/trees/HEAD?recursive=1",
             headers=headers
@@ -103,12 +100,11 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
         if not code_files:
             raise Exception("No relevant code files found in the repository.")
 
-        # ── Step 3: Select file ─────────────────────────────────────────
+        # Select file
         if filepath and filepath in code_files:
             selected_path = filepath
         else:
-            # Ask AI to pick the best file
-            file_list_str = "\n".join(code_files[:60])  # limit to avoid token explosion
+            file_list_str = "\n".join(code_files[:60])
             pick_prompt = (
                 f"Repository: {repo}\n\n"
                 f"Task description: {description or 'find and fix bugs / improve code'}\n\n"
@@ -131,14 +127,11 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
 
             if pick_res.status_code == 200:
                 ai_choice = pick_res.json()["choices"][0]["message"]["content"].strip().strip('"').strip("'")
-                if ai_choice in code_files:
-                    selected_path = ai_choice
-                else:
-                    selected_path = code_files[0]  # fallback
+                selected_path = ai_choice if ai_choice in code_files else code_files[0]
             else:
-                selected_path = code_files[0]  # safest fallback
+                selected_path = code_files[0]
 
-    # ── Step 4: Read selected file ──────────────────────────────────────
+    # Read selected file
     async with httpx.AsyncClient(timeout=30.0) as client:
         content_res = await client.get(
             f"https://api.github.com/repos/{repo}/contents/{selected_path}",
@@ -154,11 +147,10 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
         original_content = b64.b64decode(file_data["content"]).decode("utf-8", errors="replace")
         sha = file_data["sha"]
 
-        # Optional: skip very large files
         if len(original_content) > 180_000:
             return f"Skipped {selected_path} — file too large ({len(original_content)//1000} kB)"
 
-        # ── Step 5: Ask AI to fix ───────────────────────────────────────
+        # Ask AI to fix
         fix_prompt = (
             f"You are an expert code reviewer and fixer.\n"
             f"File: {selected_path}\n\n"
@@ -184,18 +176,14 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
             raise Exception(f"AI fix request failed: {fix_res.status_code}")
 
         fixed_code = fix_res.json()["choices"][0]["message"]["content"].strip()
-
-        # Clean up possible markdown fences the model sometimes adds anyway
         fixed_code = re.sub(r'^```[\w]*\n?', '', fixed_code)
         fixed_code = re.sub(r'\n?```$', '', fixed_code)
 
-        # ── Step 6: Compare & commit only if changed ─────────────────────
         if fixed_code.strip() == original_content.strip():
             return f"✅ No issues found / no changes needed in {selected_path}"
 
         encoded = b64.b64encode(fixed_code.encode("utf-8")).decode("utf-8")
 
-        # Get default branch first
         branch_res = await client.get(
             f"https://api.github.com/repos/{repo}",
             headers=headers
@@ -215,12 +203,12 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
 
         if commit_res.status_code not in (200, 201):
             err_body = commit_res.json()
-            raise Exception(f"Commit failed ({commit_res.status_code}): {err_body.get('message')} | repo={repo} | file={selected_path} | branch={default_branch} | sha={sha[:7]}")
+            raise Exception(f"Commit failed ({commit_res.status_code}): {err_body.get('message')} | repo={repo} | file={selected_path}")
 
         return f"✅ Fixed and committed {selected_path} to {repo}/{default_branch}"
 
 
-# ── Main node dispatcher ──────────────────────────────────────────
+# ── Updated Main node dispatcher (2025 version) ───────────────────────────────
 
 async def _execute_node(node_type: str, node_data: dict, user_id: str, integrations: dict, context: dict) -> str:
     label = node_data.get("label", "step").lower()
@@ -233,29 +221,69 @@ async def _execute_node(node_type: str, node_data: dict, user_id: str, integrati
     elif node_type == "ai":
         return await _execute_ai(node_data, context, integrations)
 
-    elif node_type == "action" or node_type == "notification":
-        # Email detection
+    elif node_type in ("action", "notification"):
         node_email = node_data.get("email", "")
-        if "mail" in icon or "email" in label or "@" in label or "@" in description or "@" in node_email:
-            return await _execute_email(node_data, context)
 
-        # Code edit / fix / refactor detection
-        elif any(k in label for k in ["fix", "edit", "refactor", "improve", "debug", "error", "finder", "check", "scan", "review", "clean", "lint", "bug"]) or (any(k in label for k in ["push", "commit"]) and any(k in label for k in ["main", "branch", "code"])):
+        # ── Email node ────────────────────────────────────────────────────
+        if "mail" in icon or "email" in label or "@" in label or "@" in description or "@" in node_email:
+            parent_outputs = context.get("parent_outputs", [])
+            parent_text = " ".join(str(o) for o in parent_outputs).lower()
+
+            has_errors = any(k in parent_text for k in [
+                "fixed", "committed", "commit", "pushed", "error", "bug", "issue",
+                "deprecated", "unresolved", "missing", "potential", "detected",
+                "warning", "fail", "problem", "syntax error"
+            ])
+            has_no_errors = any(k in parent_text for k in [
+                "no issues", "no errors", "no changes", "no bugs", "nothing to fix",
+                "already good", "looks good", "clean", "no syntax errors"
+            ])
+
+            node_text = (label + " " + description).lower()
+            is_error_email = any(k in node_text for k in [
+                "fix", "fixed", "error", "bug", "issue", "alert", "fail", "problem", "found"
+            ])
+            is_no_error_email = any(k in node_text for k in [
+                "no error", "no bug", "no issue", "clean", "clear", "all good", "success", "passed"
+            ])
+
+            if has_errors and has_no_errors:
+                has_no_errors = False  # errors win
+
+            if is_error_email and not is_no_error_email:
+                if parent_outputs and has_no_errors and not has_errors:
+                    return f"⏭️ Skipped '{node_data.get('label')}' — no errors were found, error alert not needed"
+                return await _execute_email(node_data, context)
+
+            elif is_no_error_email and not is_error_email:
+                if parent_outputs and has_errors and not has_no_errors:
+                    return f"⏭️ Skipped '{node_data.get('label')}' — errors were found and fixed, no-error email not needed"
+                return await _execute_email(node_data, context)
+
+            else:
+                # ambiguous → send anyway (safe default)
+                return await _execute_email(node_data, context)
+
+        # ── Code edit / fix / refactor ────────────────────────────────────
+        elif any(k in label for k in ["fix", "edit", "refactor", "improve", "debug", "error", "finder", "check", "scan", "review", "clean", "lint", "bug"]) or \
+             (any(k in label for k in ["push", "commit"]) and any(k in label for k in ["main", "branch", "code"])):
             return await _execute_ai_code_edit(node_data, integrations, context)
 
-        # Generic GitHub actions
+        # ── Generic GitHub ────────────────────────────────────────────────
         elif any(k in label for k in ["github", "commit", "push", "pr", "pull request", "branch", "repo"]) or icon in ["git-branch", "github"]:
             return await _execute_github(node_data, integrations, context)
 
-        # Slack / notifications
+        # ── Slack ─────────────────────────────────────────────────────────
         elif any(k in label for k in ["slack", "notify", "notification", "message", "alert"]) or icon in ["bell", "slack"]:
             return await _execute_slack(node_data, integrations, context)
 
-        # Notion / Linear / Jira
+        # ── Notion / Linear / Jira ────────────────────────────────────────
         elif any(k in label for k in ["notion"]):
             return await _execute_notion(node_data, integrations, context)
+
         elif any(k in label for k in ["linear", "issue", "ticket"]):
             return await _execute_linear(node_data, integrations, context)
+
         elif any(k in label for k in ["jira", "ticket", "atlassian"]):
             return await _execute_jira(node_data, integrations, context)
 
@@ -281,7 +309,6 @@ async def _execute_github(node_data: dict, integrations: dict, context: dict) ->
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
 
     async with httpx.AsyncClient() as client:
-        # Create branch
         if any(k in label for k in ["branch", "create branch"]):
             branch_name = f"devflow/{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
             r = await client.get(f"https://api.github.com/repos/{repo}", headers=headers)
@@ -295,7 +322,6 @@ async def _execute_github(node_data: dict, integrations: dict, context: dict) ->
             r3.raise_for_status()
             return f"Branch created: {branch_name} in {repo}"
 
-        # Create PR
         elif any(k in label for k in ["pr", "pull request", "open pr"]):
             parent_output = context.get("parent_outputs", [""])
             body = parent_output[-1] if parent_output else description or "Automated PR via DevFlow"
@@ -309,7 +335,6 @@ async def _execute_github(node_data: dict, integrations: dict, context: dict) ->
                 return f"PR #{pr['number']} created: {pr['html_url']}"
             return f"GitHub action completed on {repo}"
 
-        # Commit a file
         elif any(k in label for k in ["commit", "push", "upload", "file"]):
             parent_output = "\n".join(context.get("parent_outputs", []))
             content = parent_output or description or f"# Generated by DevFlow\n\nPipeline ran at {datetime.now(timezone.utc).isoformat()}"
@@ -323,7 +348,6 @@ async def _execute_github(node_data: dict, integrations: dict, context: dict) ->
                 return f"Committed {filename} to {repo}"
             raise Exception(f"GitHub commit failed: {r.json().get('message', r.status_code)}")
 
-        # Default — create an issue
         else:
             parent_output = "\n".join(context.get("parent_outputs", []))
             body = parent_output or description or "Automated issue created by DevFlow pipeline"
@@ -344,7 +368,6 @@ async def execute_workflow(nodes: list, edges: list, user_id: str, context: dict
     status = "success"
     integrations = await get_user_integrations(user_id)
 
-    # Topological sort
     node_map = {n["id"]: n for n in nodes}
     adj = {n["id"]: [] for n in nodes}
     for edge in edges:
