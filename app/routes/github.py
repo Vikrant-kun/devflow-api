@@ -288,56 +288,21 @@ async def setup_webhook(user: dict = Depends(get_current_user)):
 
 # ── Repository file tree ───────────────────────────────────────────────────
 @router.get("/tree")
-async def get_repo_tree(
-    user: dict = Depends(get_current_user)
-):
-    """
-    Returns flat list of all files (blobs) in the default branch (usually main/master)
-    Uses recursive=1 tree endpoint → good for small to medium repositories
-    """
+async def get_repo_tree(user: dict = Depends(get_current_user)):
     token = get_github_token(user)
-
-    # Get selected repo
-    result = (
-        supabase.table("user_settings")
-        .select("selected_repo_full_name")
-        .eq("user_id", user["user_id"])
-        .execute()
-    )
-
-    if not result.data or not result.data[0].get("selected_repo_full_name"):
-        raise HTTPException(
-            status_code=400,
-            detail="No repository selected. Please select a repository first."
-        )
-
-    repo_full_name = result.data[0]["selected_repo_full_name"]
-
+    result = supabase.table("user_settings").select("selected_repo_full_name").eq("user_id", user["user_id"]).execute()
+    repo = result.data[0].get("selected_repo_full_name") if result.data else None
+    if not repo:
+        raise HTTPException(status_code=400, detail="No repo selected")
     async with httpx.AsyncClient() as client:
         res = await client.get(
-            f"https://api.github.com/repos/{repo_full_name}/git/trees/HEAD?recursive=1",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github+json"
-            },
-            timeout=15.0
+            f"https://api.github.com/repos/{repo}/git/trees/HEAD?recursive=1",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
         )
-
         if res.status_code != 200:
-            detail = res.json().get("message", "Could not fetch repository tree")
-            if "Not Found" in detail or res.status_code == 404:
-                raise HTTPException(404, "Repository not found or access denied")
-            raise HTTPException(status_code=400, detail=detail)
-
-        tree = res.json().get("tree", [])
-        files = [item["path"] for item in tree if item["type"] == "blob"]
-
-    return JSONResponse({
-        "files": files[:50],
-        "repo": repo_full_name,
-        "count": len(files),
-        "truncated": len(files) > 50
-    })
+            raise HTTPException(status_code=400, detail="Could not fetch repo tree")
+        files = [f["path"] for f in res.json().get("tree", []) if f["type"] == "blob"]
+        return {"files": files[:50], "repo": repo}
 
 
 @router.post("/select-repo")
