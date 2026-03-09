@@ -23,7 +23,6 @@ async def _execute_email(node_data: dict, context: dict) -> str:
     description = node_data.get("description", "")
     parent_output = "\n".join(context.get("parent_outputs", []))
 
-    # Check explicit email field first, then scan label/description
     to_email = node_data.get("email", "")
     if not to_email:
         text = f"{label} {description}"
@@ -74,7 +73,6 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
     description = (node_data.get("description") or node_data.get("label") or "").strip()
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
 
-    # Try to extract explicit file path
     file_match = re.search(r'(?:file|path|fix|edit|in|at)\s*:\s*([a-zA-Z0-9_/.-]+\.[a-zA-Z0-9]+)', description, re.IGNORECASE)
     if not file_match:
         file_match = re.search(r'[a-zA-Z0-9_/.-]+\.(?:py|js|jsx|ts|tsx|css|html|json|md|yaml|yml|java|go|rs|cpp|c|h)', description)
@@ -82,7 +80,6 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
     filepath = file_match.group(0).strip() if file_match else None
 
     async with httpx.AsyncClient(timeout=45.0) as client:
-        # Get file tree
         tree_res = await client.get(
             f"https://api.github.com/repos/{repo}/git/trees/HEAD?recursive=1",
             headers=headers
@@ -101,7 +98,6 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
         if not code_files:
             raise Exception("No relevant code files found in the repository.")
 
-        # Select file
         if filepath and filepath in code_files:
             selected_path = filepath
         else:
@@ -132,7 +128,6 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
             else:
                 selected_path = code_files[0]
 
-    # Read selected file
     async with httpx.AsyncClient(timeout=30.0) as client:
         content_res = await client.get(
             f"https://api.github.com/repos/{repo}/contents/{selected_path}",
@@ -151,7 +146,6 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
         if len(original_content) > 180_000:
             return f"Skipped {selected_path} — file too large ({len(original_content)//1000} kB)"
 
-        # Ask AI to fix
         fix_prompt = (
             f"You are an expert code reviewer and fixer.\n"
             f"File: {selected_path}\n\n"
@@ -209,6 +203,27 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
         return f"✅ Fixed and committed {selected_path} to {repo}/{default_branch}"
 
 
+# ── Helper: Get all ancestor outputs ─────────────────────────────────────────
+
+def _get_all_ancestor_outputs(node_id: str, edges: list, all_node_outputs: dict) -> str:
+    """Walk the full ancestor chain and return all outputs as one string."""
+    visited = set()
+    queue = [node_id]
+    all_outputs = []
+    while queue:
+        nid = queue.pop(0)
+        if nid in visited:
+            continue
+        visited.add(nid)
+        # find parents of this node
+        parents = [e["source"] for e in edges if e["target"] == nid]
+        for parent_id in parents:
+            if parent_id in all_node_outputs:
+                all_outputs.append(str(all_node_outputs[parent_id]))
+            queue.append(parent_id)
+    return " ".join(all_outputs)
+
+
 # ── Main node dispatcher ─────────────────────────────────────────────
 
 async def _execute_node(node_type: str, node_data: dict, user_id: str, integrations: dict, context: dict) -> str:
@@ -227,39 +242,45 @@ async def _execute_node(node_type: str, node_data: dict, user_id: str, integrati
 
         # ── Email node ────────────────────────────────────────────────────
         if "mail" in icon or "email" in label or "@" in label or "@" in description or "@" in node_email:
-            parent_outputs = context.get("parent_outputs", [])
-            parent_text = " ".join(str(o) for o in parent_outputs).lower()
+            # Walk the FULL ancestor chain, not just direct parents
+            all_node_outputs = context.get("all_node_outputs", {})
+            edges = context.get("edges", [])
+            current_node_id = context.get("current_node_id", "")
+            ancestor_text = _get_all_ancestor_outputs(current_node_id, edges, all_node_outputs)
 
-            # Strong error signals — more specific phrases
-            error_signals = [
-                "fixed and committed", "syntax error", "syntax errors",
-                "undefined variable", "unresolved variable", "deprecated",
-                "unused function", "unused variable", "missing semicolon",
-                "potential issue", "potential issues", "detected",
-                "error in ", "errors in ", "bug found", "bugs found",
-                "issue found", "issues found", "warning",
-            ]
-            clean_signals = [
-                "no issues found", "no errors found", "no bugs found",
-                "no changes needed", "nothing to fix", "already good",
-                "no syntax errors found", "✅ no issues", "code is clean",
-                "looks good",
-            ]
+            # Reliable signals from _execute_ai_code_edit
+            code_was_fixed = "✅ Fixed and committed" in ancestor_text
+            code_was_clean = "✅ No issues found" in ancestor_text or "✅ no issues" in ancestor_text.lower()
 
-            has_errors = any(signal in parent_text for signal in error_signals)
-            is_clean = any(signal in parent_text for signal in clean_signals) and not has_errors
+            # Determine ground truth
+            if code_was_fixed:
+                has_errors = True
+                is_clean = False
+            elif code_was_clean:
+                has_errors = False
+                is_clean = True
+            else:
+                # Fallback when no code edit node ran
+                parent_outputs = context.get("parent_outputs", [])
+                parent_text = " ".join(str(o) for o in parent_outputs).lower()
+                number_pattern = re.search(r'\b([1-9]\d*)\s+(error|bug|issue|vulnerabilit|problem|warning)', parent_text)
+                has_errors = bool(number_pattern)
+                is_clean = not has_errors and any(k in parent_text for k in [
+                    "no error", "no bug", "no issue", "clean", "no syntax error",
+                    "no problems", "nothing found", "all clear"
+                ])
 
-            # Classify this email node's intent
+            # Classify email node intent
             node_text = (label + " " + description).lower()
             is_error_email = any(k in node_text for k in [
-                "fix", "fixed", "error", "bug", "issue", "alert", "fail", "problem", "found", "detected"
+                "fix", "fixed", "error", "bug", "issue", "alert", "fail", "problem", "found", "detected", "vulnerab"
             ])
             is_no_error_email = any(k in node_text for k in [
-                "no error", "no bug", "no issue", "clean", "clear", "all good", "passed", "no errors"
+                "no error", "no bug", "no issue", "clean", "clear", "all good", "passed", "no errors", "no problem"
             ])
 
-            # No parent output yet — send unconditionally
-            if not parent_outputs:
+            # Default: send if no clear signal
+            if not has_errors and not is_clean:
                 return await _execute_email(node_data, context)
 
             if is_error_email and not is_no_error_email:
@@ -273,7 +294,6 @@ async def _execute_node(node_type: str, node_data: dict, user_id: str, integrati
                 return await _execute_email(node_data, context)
 
             else:
-                # Ambiguous intent — safe default: send
                 return await _execute_email(node_data, context)
 
         # ── Code edit / fix / refactor ────────────────────────────────────
@@ -430,7 +450,14 @@ async def execute_workflow(nodes: list, edges: list, user_id: str, context: dict
         label = node_data.get("label", "Unknown Step")
 
         parent_outputs = [node_outputs[e["source"]] for e in edges if e["target"] == nid and e["source"] in node_outputs]
-        node_context = {**context, "parent_outputs": parent_outputs}
+
+        node_context = {
+            **context,
+            "parent_outputs": parent_outputs,
+            "all_node_outputs": node_outputs,
+            "edges": edges,
+            "current_node_id": nid,
+        }
 
         t_start = datetime.now(timezone.utc)
         try:
@@ -526,7 +553,14 @@ async def execute_workflow_ws(
             })
 
         parent_outputs = [node_outputs[e["source"]] for e in edges if e["target"] == nid and e["source"] in node_outputs]
-        node_context = {**context, "parent_outputs": parent_outputs}
+
+        node_context = {
+            **context,
+            "parent_outputs": parent_outputs,
+            "all_node_outputs": node_outputs,
+            "edges": edges,
+            "current_node_id": nid,
+        }
 
         t_start = datetime.now(timezone.utc)
         try:
