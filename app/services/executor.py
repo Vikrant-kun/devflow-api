@@ -213,7 +213,8 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
         )
 
         if commit_res.status_code not in (200, 201):
-            raise Exception(f"Commit failed: {commit_res.json().get('message', commit_res.status_code)}")
+            err_body = commit_res.json()
+            raise Exception(f"Commit failed ({commit_res.status_code}): {err_body.get('message')} | repo={repo} | file={selected_path} | branch={default_branch} | sha={sha[:7]}")
 
         return f"✅ Fixed and committed {selected_path} to {repo}/{default_branch}"
 
