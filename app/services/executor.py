@@ -207,6 +207,9 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
 
 def _get_all_ancestor_outputs(node_id: str, edges: list, all_node_outputs: dict) -> str:
     """Walk the full ancestor chain and return all outputs as one string."""
+    if not node_id or not edges or not all_node_outputs:
+        # Fallback: just return everything we have
+        return " ".join(str(v) for v in all_node_outputs.values())
     visited = set()
     queue = [node_id]
     all_outputs = []
@@ -215,12 +218,15 @@ def _get_all_ancestor_outputs(node_id: str, edges: list, all_node_outputs: dict)
         if nid in visited:
             continue
         visited.add(nid)
-        # find parents of this node
         parents = [e["source"] for e in edges if e["target"] == nid]
         for parent_id in parents:
             if parent_id in all_node_outputs:
                 all_outputs.append(str(all_node_outputs[parent_id]))
-            queue.append(parent_id)
+            if parent_id not in visited:
+                queue.append(parent_id)
+    # If we found nothing via ancestor walk, return ALL outputs as fallback
+    if not all_outputs:
+        return " ".join(str(v) for v in all_node_outputs.values())
     return " ".join(all_outputs)
 
 
@@ -242,17 +248,20 @@ async def _execute_node(node_type: str, node_data: dict, user_id: str, integrati
 
         # ── Email node ────────────────────────────────────────────────────
         if "mail" in icon or "email" in label or "@" in label or "@" in description or "@" in node_email:
-            # Walk the FULL ancestor chain, not just direct parents
             all_node_outputs = context.get("all_node_outputs", {})
             edges = context.get("edges", [])
             current_node_id = context.get("current_node_id", "")
+            print(f"DEBUG EMAIL NODE: label={label!r} | current_node_id={current_node_id!r} | all_outputs_keys={list(all_node_outputs.keys())}")
+            # Get ALL ancestor outputs — with fallback to everything if walk fails
             ancestor_text = _get_all_ancestor_outputs(current_node_id, edges, all_node_outputs)
-
-            # Reliable signals from _execute_ai_code_edit
+            print(f"DEBUG ANCESTOR TEXT: {ancestor_text[:300]!r}")
+            # Ground truth — these come from our own code, not AI
             code_was_fixed = "✅ Fixed and committed" in ancestor_text
-            code_was_clean = "✅ No issues found" in ancestor_text or "✅ no issues" in ancestor_text.lower()
-
-            # Determine ground truth
+            code_was_clean = ("✅ No issues found" in ancestor_text or
+                              "no changes needed" in ancestor_text.lower())
+            print(f"DEBUG: code_was_fixed={code_was_fixed} | code_was_clean={code_was_clean}")
+            # Determine final state
+            # If BOTH appear (multiple nodes ran), fixed wins over clean
             if code_was_fixed:
                 has_errors = True
                 is_clean = False
@@ -260,39 +269,40 @@ async def _execute_node(node_type: str, node_data: dict, user_id: str, integrati
                 has_errors = False
                 is_clean = True
             else:
-                # Fallback when no code edit node ran
+                # No code edit nodes in ancestors — check direct parent text
                 parent_outputs = context.get("parent_outputs", [])
                 parent_text = " ".join(str(o) for o in parent_outputs).lower()
-                number_pattern = re.search(r'\b([1-9]\d*)\s+(error|bug|issue|vulnerabilit|problem|warning)', parent_text)
-                has_errors = bool(number_pattern)
+                number_match = re.search(
+                    r'\b([1-9]\d*)\s+(error|bug|issue|vulnerabilit|problem|warning)',
+                    parent_text
+                )
+                has_errors = bool(number_match)
                 is_clean = not has_errors and any(k in parent_text for k in [
-                    "no error", "no bug", "no issue", "clean", "no syntax error",
-                    "no problems", "nothing found", "all clear"
+                    "no error", "no bug", "no issue", "no syntax error",
+                    "nothing found", "all clear", "no problems"
                 ])
-
-            # Classify email node intent
+            # Classify this email node's intent
             node_text = (label + " " + description).lower()
             is_error_email = any(k in node_text for k in [
-                "fix", "fixed", "error", "bug", "issue", "alert", "fail", "problem", "found", "detected", "vulnerab"
+                "fix", "fixed", "error", "bug", "issue", "alert",
+                "fail", "problem", "found", "detected", "vulnerab"
             ])
             is_no_error_email = any(k in node_text for k in [
-                "no error", "no bug", "no issue", "clean", "clear", "all good", "passed", "no errors", "no problem"
+                "no error", "no bug", "no issue", "clean", "clear",
+                "all good", "passed", "no errors", "no problem"
             ])
-
-            # Default: send if no clear signal
+            print(f"DEBUG: is_error_email={is_error_email} | is_no_error_email={is_no_error_email} | has_errors={has_errors} | is_clean={is_clean}")
+            # No signal either way — just send
             if not has_errors and not is_clean:
                 return await _execute_email(node_data, context)
-
             if is_error_email and not is_no_error_email:
                 if is_clean and not has_errors:
                     return f"⏭️ Skipped '{node_data.get('label')}' — no errors found, error alert not needed"
                 return await _execute_email(node_data, context)
-
             elif is_no_error_email and not is_error_email:
                 if has_errors and not is_clean:
                     return f"⏭️ Skipped '{node_data.get('label')}' — errors were found, no-error email not needed"
                 return await _execute_email(node_data, context)
-
             else:
                 return await _execute_email(node_data, context)
 
