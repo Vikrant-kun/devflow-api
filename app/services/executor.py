@@ -22,7 +22,7 @@ async def _execute_email(node_data: dict, context: dict) -> str:
     label = node_data.get("label", "")
     description = node_data.get("description", "")
     parent_output = "\n".join(context.get("parent_outputs", []))
-    
+
     # Check explicit email field first, then scan label/description
     to_email = node_data.get("email", "")
     if not to_email:
@@ -31,8 +31,9 @@ async def _execute_email(node_data: dict, context: dict) -> str:
         if not match:
             raise Exception("No email address found. Add an email in the node config panel.")
         to_email = match.group(0)
+
     body = parent_output or description or f"DevFlow pipeline step '{label}' completed."
-    
+
     async with httpx.AsyncClient() as client:
         res = await client.post(
             "https://api.resend.com/emails",
@@ -208,7 +209,7 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
         return f"✅ Fixed and committed {selected_path} to {repo}/{default_branch}"
 
 
-# ── Updated Main node dispatcher (2025 version) ───────────────────────────────
+# ── Updated Main node dispatcher ─────────────────────────────────────────────
 
 async def _execute_node(node_type: str, node_data: dict, user_id: str, integrations: dict, context: dict) -> str:
     label = node_data.get("label", "step").lower()
@@ -229,39 +230,50 @@ async def _execute_node(node_type: str, node_data: dict, user_id: str, integrati
             parent_outputs = context.get("parent_outputs", [])
             parent_text = " ".join(str(o) for o in parent_outputs).lower()
 
-            has_errors = any(k in parent_text for k in [
-                "fixed", "committed", "commit", "pushed", "error", "bug", "issue",
-                "deprecated", "unresolved", "missing", "potential", "detected",
-                "warning", "fail", "problem", "syntax error"
-            ])
-            has_no_errors = any(k in parent_text for k in [
-                "no issues", "no errors", "no changes", "no bugs", "nothing to fix",
-                "already good", "looks good", "clean", "no syntax errors"
-            ])
+            # Strong error signals
+            error_signals = [
+                "fixed and committed", "syntax error", "syntax errors",
+                "undefined variable", "unresolved variable", "deprecated",
+                "unused function", "unused variable", "missing semicolon",
+                "potential issue", "potential issues", "detected",
+                "error in ", "errors in ", "bug found", "bugs found",
+                "issue found", "issues found", "warning",
+            ]
+            clean_signals = [
+                "no issues found", "no errors found", "no bugs found",
+                "no changes needed", "nothing to fix", "already good",
+                "no syntax errors found", "✅ no issues", "code is clean",
+                "looks good",
+            ]
 
+            has_errors = any(signal in parent_text for signal in error_signals)
+            is_clean = any(signal in parent_text for signal in clean_signals) and not has_errors
+
+            # Classify node intent
             node_text = (label + " " + description).lower()
             is_error_email = any(k in node_text for k in [
-                "fix", "fixed", "error", "bug", "issue", "alert", "fail", "problem", "found"
+                "fix", "fixed", "error", "bug", "issue", "alert", "fail", "problem", "found", "detected"
             ])
             is_no_error_email = any(k in node_text for k in [
-                "no error", "no bug", "no issue", "clean", "clear", "all good", "success", "passed"
+                "no error", "no bug", "no issue", "clean", "clear", "all good", "passed", "no errors"
             ])
 
-            if has_errors and has_no_errors:
-                has_no_errors = False  # errors win
+            # No parent output → send unconditionally
+            if not parent_outputs:
+                return await _execute_email(node_data, context)
 
             if is_error_email and not is_no_error_email:
-                if parent_outputs and has_no_errors and not has_errors:
-                    return f"⏭️ Skipped '{node_data.get('label')}' — no errors were found, error alert not needed"
+                if is_clean and not has_errors:
+                    return f"⏭️ Skipped '{node_data.get('label')}' — no errors found, error alert not needed"
                 return await _execute_email(node_data, context)
 
             elif is_no_error_email and not is_error_email:
-                if parent_outputs and has_errors and not has_no_errors:
-                    return f"⏭️ Skipped '{node_data.get('label')}' — errors were found and fixed, no-error email not needed"
+                if has_errors and not is_clean:
+                    return f"⏭️ Skipped '{node_data.get('label')}' — errors were found, no-error email not needed"
                 return await _execute_email(node_data, context)
 
             else:
-                # ambiguous → send anyway (safe default)
+                # Can't determine intent → send anyway
                 return await _execute_email(node_data, context)
 
         # ── Code edit / fix / refactor ────────────────────────────────────
@@ -360,7 +372,7 @@ async def _execute_github(node_data: dict, integrations: dict, context: dict) ->
             raise Exception(f"GitHub API error: {r.json().get('message', r.status_code)}")
 
 
-# ── execute_workflow (sync version) ──────────────────────────────────────
+# ── Workflow execution ─────────────────────────────────────────────
 
 async def execute_workflow(nodes: list, edges: list, user_id: str, context: dict = {}) -> dict:
     start = datetime.now(timezone.utc)
@@ -525,7 +537,7 @@ async def execute_workflow_ws(
     }
 
 
-# ── Other executors (unchanged) ───────────────────────────────────
+# ── Other executors ───────────────────────────────────────────────
 
 async def _execute_ai(node_data: dict, context: dict, integrations: dict) -> str:
     description = node_data.get("description", "")
@@ -625,29 +637,28 @@ async def _execute_linear(node_data: dict, integrations: dict, context: dict) ->
 async def _execute_jira(node_data: dict, integrations: dict, context: dict) -> str:
     token = integrations.get("jira_token")
     domain = integrations.get("jira_domain")
-    
+
     if not token or not domain:
         raise Exception("Jira not connected. Go to Integrations → Connect Jira.")
-        
-    import base64
+
     label = node_data.get("label", "Issue")
     description = node_data.get("description", "") or "\n".join(context.get("parent_outputs", []))
-    
+
     async with httpx.AsyncClient() as client:
-        auth = base64.b64encode(f"devflow:{token}".encode()).decode()
+        auth = b64.b64encode(f"devflow:{token}".encode()).decode()
         headers = {"Authorization": f"Basic {auth}", "Content-Type": "application/json"}
-        
+
         r = await client.get(f"https://{domain}/rest/api/3/project?maxResults=1", headers=headers, timeout=10.0)
         r.raise_for_status()
         projects = r.json()
-        
+
         project_list = projects if isinstance(projects, list) else projects.get("values", [])
-        
+
         if not project_list:
             raise Exception("No Jira projects found.")
-            
+
         project_key = project_list[0]["key"]
-        
+
         res = await client.post(f"https://{domain}/rest/api/3/issue", headers=headers,
             json={"fields": {
                 "project": {"key": project_key},
@@ -659,5 +670,5 @@ async def _execute_jira(node_data: dict, integrations: dict, context: dict) -> s
             }}, timeout=10.0)
         res.raise_for_status()
         issue = res.json()
-        
+
         return f"Jira issue created: {issue['key']} — https://{domain}/browse/{issue['key']}"
