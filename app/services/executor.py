@@ -12,6 +12,7 @@ async def get_user_integrations(user_id: str) -> dict:
     result = supabase.table("user_settings").select(
         "github_token, selected_repo_full_name, slack_webhook_url, notion_token, linear_token, jira_token, jira_domain"
     ).eq("user_id", user_id).execute()
+    print(f"DEBUG get_user_integrations: user_id={user_id}, rows={len(result.data)}, data={result.data}")
     return result.data[0] if result.data else {}
 
 
