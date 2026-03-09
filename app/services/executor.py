@@ -7,7 +7,6 @@ from app.database import supabase
 
 
 # ── Fetch user integrations ───────────────────────────────────────
-
 async def get_user_integrations(user_id: str) -> dict:
     result = supabase.table("user_settings").select(
         "github_token, selected_repo_full_name, slack_webhook_url, notion_token, linear_token, jira_token, jira_domain"
@@ -17,7 +16,6 @@ async def get_user_integrations(user_id: str) -> dict:
 
 
 # ── Email executor ────────────────────────────────────────────────
-
 async def _execute_email(node_data: dict, context: dict) -> str:
     label = node_data.get("label", "")
     description = node_data.get("description", "")
@@ -63,7 +61,6 @@ async def _execute_email(node_data: dict, context: dict) -> str:
 
 
 # ── AI Code Edit executor ────────────────────────────────────────────────────
-
 async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: dict) -> str:
     token = integrations.get("github_token")
     repo = integrations.get("selected_repo_full_name")
@@ -203,8 +200,32 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
         return f"✅ Fixed and committed {selected_path} to {repo}/{default_branch}"
 
 
-# ── Helper: Get all ancestor outputs ─────────────────────────────────────────
+# ── Helper: evaluate a conditional edge ──────────────────────────────
+def _edge_condition_passes(condition: str, parent_output: str) -> bool:
+    """Returns True if the edge condition matches the parent node's output."""
+    if not condition or condition == "always":
+        return True
 
+    out = parent_output.lower()
+
+    if condition == "errors_found":
+        return (
+            "✅ fixed and committed" in out or
+            "fixed and committed" in out or
+            "##status:errors_found##" in out
+        )
+
+    if condition == "no_errors":
+        return (
+            "✅ no issues found" in out or
+            "no changes needed" in out or
+            "##status:no_errors##" in out
+        )
+
+    return True  # unknown condition → always pass
+
+
+# ── Helper: Get all ancestor outputs ─────────────────────────────────────────
 def _get_all_ancestor_outputs(node_id: str, edges: list, all_node_outputs: dict) -> str:
     """Walk the full ancestor chain and return all outputs as one string."""
     if not node_id or not edges or not all_node_outputs:
@@ -229,7 +250,6 @@ def _get_all_ancestor_outputs(node_id: str, edges: list, all_node_outputs: dict)
 
 
 # ── Main node dispatcher ─────────────────────────────────────────────
-
 async def _execute_node(node_type: str, node_data: dict, user_id: str, integrations: dict, context: dict) -> str:
     label = node_data.get("label", "step").lower()
     icon = node_data.get("icon", "")
@@ -345,7 +365,6 @@ async def _execute_node(node_type: str, node_data: dict, user_id: str, integrati
 
 
 # ── GitHub executor ───────────────────────────────────────────────
-
 async def _execute_github(node_data: dict, integrations: dict, context: dict) -> str:
     token = integrations.get("github_token")
     repo = integrations.get("selected_repo_full_name")
@@ -431,203 +450,7 @@ async def _execute_github(node_data: dict, integrations: dict, context: dict) ->
             raise Exception(f"GitHub API error: {r.json().get('message', r.status_code)}")
 
 
-# ── Workflow execution ─────────────────────────────────────────────
-
-async def execute_workflow(nodes: list, edges: list, user_id: str, context: dict = {}) -> dict:
-    start = datetime.now(timezone.utc)
-    logs = []
-    status = "success"
-    integrations = await get_user_integrations(user_id)
-
-    node_map = {n["id"]: n for n in nodes}
-    adj = {n["id"]: [] for n in nodes}
-    for edge in edges:
-        adj[edge["source"]].append(edge["target"])
-
-    has_incoming = {e["target"] for e in edges}
-    roots = [n["id"] for n in nodes if n["id"] not in has_incoming]
-    if not roots:
-        roots = [nodes[0]["id"]] if nodes else []
-
-    visited, stack, seen = [], list(roots), set()
-    while stack:
-        nid = stack.pop()
-        if nid in seen:
-            continue
-        seen.add(nid)
-        visited.append(nid)
-        stack.extend(reversed(adj.get(nid, [])))
-
-    node_outputs = {}
-
-    for nid in visited:
-        node = node_map.get(nid)
-        if not node:
-            continue
-        node_data = node.get("data", {})
-        node_type = node_data.get("type", node.get("type", "action"))
-        label = node_data.get("label", "Unknown Step")
-
-        parent_outputs = [node_outputs[e["source"]] for e in edges if e["target"] == nid and e["source"] in node_outputs]
-
-        node_context = {
-            **context,
-            "parent_outputs": parent_outputs,
-            "all_node_outputs": node_outputs,
-            "edges": edges,
-            "current_node_id": nid,
-        }
-
-        t_start = datetime.now(timezone.utc)
-        try:
-            result = await _execute_node(node_type, node_data, user_id, integrations, node_context)
-            node_outputs[nid] = result
-            duration = f"{(datetime.now(timezone.utc) - t_start).total_seconds():.1f}s"
-            logs.append({
-                "node_id": nid,
-                "node_label": label,
-                "type": node_type,
-                "status": "success",
-                "message": result,
-                "duration": duration,
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            })
-        except Exception as e:
-            status = "failed"
-            duration = f"{(datetime.now(timezone.utc) - t_start).total_seconds():.1f}s"
-            logs.append({
-                "node_id": nid,
-                "node_label": label,
-                "type": node_type,
-                "status": "failed",
-                "message": str(e),
-                "duration": duration,
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            })
-            break
-
-    end = datetime.now(timezone.utc)
-    secs = (end - start).total_seconds()
-    return {
-        "status": status,
-        "duration": f"{int(secs // 60)}m {int(secs % 60)}s" if secs >= 60 else f"{secs:.1f}s",
-        "logs": logs,
-        "started_at": start.isoformat(),
-        "finished_at": end.isoformat()
-    }
-
-
-# ── WebSocket-aware executor ──────────────────────────────────────
-
-async def execute_workflow_ws(
-    nodes: list,
-    edges: list,
-    user_id: str,
-    context: dict = {},
-    on_node_complete=None
-) -> dict:
-    start = datetime.now(timezone.utc)
-    logs = []
-    status = "success"
-    integrations = await get_user_integrations(user_id)
-
-    node_map = {n["id"]: n for n in nodes}
-    adj = {n["id"]: [] for n in nodes}
-    for edge in edges:
-        adj[edge["source"]].append(edge["target"])
-
-    has_incoming = {e["target"] for e in edges}
-    roots = [n["id"] for n in nodes if n["id"] not in has_incoming]
-    if not roots:
-        roots = [nodes[0]["id"]] if nodes else []
-
-    visited, stack, seen = [], list(roots), set()
-    while stack:
-        nid = stack.pop()
-        if nid in seen:
-            continue
-        seen.add(nid)
-        visited.append(nid)
-        stack.extend(reversed(adj.get(nid, [])))
-
-    node_outputs = {}
-
-    for nid in visited:
-        node = node_map.get(nid)
-        if not node:
-            continue
-        node_data = node.get("data", {})
-        node_type = node_data.get("type", node.get("type", "action"))
-        label = node_data.get("label", "Unknown Step")
-
-        if on_node_complete:
-            await on_node_complete({
-                "node_id": nid,
-                "node_label": label,
-                "type": node_type,
-                "status": "running",
-                "message": "Executing...",
-                "duration": None,
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            })
-
-        parent_outputs = [node_outputs[e["source"]] for e in edges if e["target"] == nid and e["source"] in node_outputs]
-
-        node_context = {
-            **context,
-            "parent_outputs": parent_outputs,
-            "all_node_outputs": node_outputs,
-            "edges": edges,
-            "current_node_id": nid,
-        }
-
-        t_start = datetime.now(timezone.utc)
-        try:
-            result = await _execute_node(node_type, node_data, user_id, integrations, node_context)
-            node_outputs[nid] = result
-            duration = f"{(datetime.now(timezone.utc) - t_start).total_seconds():.1f}s"
-            log_entry = {
-                "node_id": nid,
-                "node_label": label,
-                "type": node_type,
-                "status": "success",
-                "message": result,
-                "duration": duration,
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            }
-            logs.append(log_entry)
-            if on_node_complete:
-                await on_node_complete(log_entry)
-        except Exception as e:
-            status = "failed"
-            duration = f"{(datetime.now(timezone.utc) - t_start).total_seconds():.1f}s"
-            log_entry = {
-                "node_id": nid,
-                "node_label": label,
-                "type": node_type,
-                "status": "failed",
-                "message": str(e),
-                "duration": duration,
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            }
-            logs.append(log_entry)
-            if on_node_complete:
-                await on_node_complete(log_entry)
-            break
-
-    end = datetime.now(timezone.utc)
-    secs = (end - start).total_seconds()
-    return {
-        "status": status,
-        "duration": f"{int(secs // 60)}m {int(secs % 60)}s" if secs >= 60 else f"{secs:.1f}s",
-        "logs": logs,
-        "started_at": start.isoformat(),
-        "finished_at": end.isoformat()
-    }
-
-
 # ── Other executors ───────────────────────────────────────────────
-
 async def _execute_ai(node_data: dict, context: dict, integrations: dict) -> str:
     description = node_data.get("description", "")
     label = node_data.get("label", "AI Step")
@@ -761,3 +584,276 @@ async def _execute_jira(node_data: dict, integrations: dict, context: dict) -> s
         issue = res.json()
 
         return f"Jira issue created: {issue['key']} — https://{domain}/browse/{issue['key']}"
+
+
+# ── Workflow execution ─────────────────────────────────────────────
+async def execute_workflow(nodes: list, edges: list, user_id: str, context: dict = {}) -> dict:
+    start = datetime.now(timezone.utc)
+    logs = []
+    status = "success"
+    integrations = await get_user_integrations(user_id)
+
+    node_map = {n["id"]: n for n in nodes}
+
+    # Build adjacency list — store full edge objects, not just target ids
+    adj: dict[str, list[dict]] = {n["id"]: [] for n in nodes}
+    for edge in edges:
+        adj[edge["source"]].append(edge)  # store whole edge
+
+    has_incoming = {e["target"] for e in edges}
+    roots = [n["id"] for n in nodes if n["id"] not in has_incoming]
+    if not roots:
+        roots = [nodes[0]["id"]] if nodes else []
+
+    # DFS traversal to get topological execution order
+    visited, stack, seen = [], list(roots), set()
+    while stack:
+        nid = stack.pop()
+        if nid in seen:
+            continue
+        seen.add(nid)
+        visited.append(nid)
+        stack.extend(reversed([e["target"] for e in adj.get(nid, [])]))
+
+    node_outputs: dict[str, str] = {}
+    skipped_nodes: set[str] = set()  # nodes skipped due to failed condition
+
+    for nid in visited:
+        node = node_map.get(nid)
+        if not node:
+            continue
+
+        node_data = node.get("data", {})
+        node_type = node_data.get("type", node.get("type", "action"))
+        label = node_data.get("label", "Unknown Step")
+
+        # ── Check if ALL incoming conditional edges pass ──────────────
+        incoming_edges = [e for e in edges if e["target"] == nid]
+        should_skip = False
+
+        for edge in incoming_edges:
+            source_id = edge["source"]
+            condition = edge.get("condition", "always")
+
+            # If parent was skipped, skip this node too (cascade)
+            if source_id in skipped_nodes:
+                should_skip = True
+                break
+
+            # If there's a condition, evaluate it against parent output
+            if condition and condition != "always":
+                parent_out = node_outputs.get(source_id, "")
+                if not _edge_condition_passes(condition, parent_out):
+                    should_skip = True
+                    break
+
+        if should_skip:
+            skipped_nodes.add(nid)
+            logs.append({
+                "node_id": nid,
+                "node_label": label,
+                "type": node_type,
+                "status": "skipped",
+                "message": f"⏭️ Skipped — condition not met",
+                "duration": "0.0s",
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            })
+            continue
+
+        # ── Execute node ──────────────────────────────────────────────
+        parent_outputs = [
+            node_outputs[e["source"]]
+            for e in edges
+            if e["target"] == nid and e["source"] in node_outputs
+        ]
+        node_context = {
+            **context,
+            "parent_outputs": parent_outputs,
+            "all_node_outputs": node_outputs,
+            "edges": edges,
+            "current_node_id": nid,
+        }
+
+        t_start = datetime.now(timezone.utc)
+        try:
+            result = await _execute_node(node_type, node_data, user_id, integrations, node_context)
+            node_outputs[nid] = result
+            duration = f"{(datetime.now(timezone.utc) - t_start).total_seconds():.1f}s"
+            logs.append({
+                "node_id": nid,
+                "node_label": label,
+                "type": node_type,
+                "status": "success",
+                "message": result,
+                "duration": duration,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            })
+        except Exception as e:
+            status = "failed"
+            duration = f"{(datetime.now(timezone.utc) - t_start).total_seconds():.1f}s"
+            logs.append({
+                "node_id": nid,
+                "node_label": label,
+                "type": node_type,
+                "status": "failed",
+                "message": str(e),
+                "duration": duration,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            })
+            break
+
+    end = datetime.now(timezone.utc)
+    secs = (end - start).total_seconds()
+    return {
+        "status": status,
+        "duration": f"{int(secs // 60)}m {int(secs % 60)}s" if secs >= 60 else f"{secs:.1f}s",
+        "logs": logs,
+        "started_at": start.isoformat(),
+        "finished_at": end.isoformat()
+    }
+
+
+# ── WebSocket-aware executor (optional – include if you use WS) ───────
+async def execute_workflow_ws(
+    nodes: list,
+    edges: list,
+    user_id: str,
+    context: dict = {},
+    on_node_complete=None
+) -> dict:
+    start = datetime.now(timezone.utc)
+    logs = []
+    status = "success"
+    integrations = await get_user_integrations(user_id)
+
+    node_map = {n["id"]: n for n in nodes}
+    adj: dict[str, list[dict]] = {n["id"]: [] for n in nodes}
+    for edge in edges:
+        adj[edge["source"]].append(edge)
+
+    has_incoming = {e["target"] for e in edges}
+    roots = [n["id"] for n in nodes if n["id"] not in has_incoming]
+    if not roots:
+        roots = [nodes[0]["id"]] if nodes else []
+
+    visited, stack, seen = [], list(roots), set()
+    while stack:
+        nid = stack.pop()
+        if nid in seen:
+            continue
+        seen.add(nid)
+        visited.append(nid)
+        stack.extend(reversed([e["target"] for e in adj.get(nid, [])]))
+
+    node_outputs: dict[str, str] = {}
+    skipped_nodes: set[str] = set()
+
+    for nid in visited:
+        node = node_map.get(nid)
+        if not node:
+            continue
+
+        node_data = node.get("data", {})
+        node_type = node_data.get("type", node.get("type", "action"))
+        label = node_data.get("label", "Unknown Step")
+
+        if on_node_complete:
+            await on_node_complete({
+                "node_id": nid,
+                "node_label": label,
+                "type": node_type,
+                "status": "running",
+                "message": "Executing...",
+                "duration": None,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            })
+
+        incoming_edges = [e for e in edges if e["target"] == nid]
+        should_skip = False
+
+        for edge in incoming_edges:
+            source_id = edge["source"]
+            condition = edge.get("condition", "always")
+
+            if source_id in skipped_nodes:
+                should_skip = True
+                break
+
+            if condition and condition != "always":
+                parent_out = node_outputs.get(source_id, "")
+                if not _edge_condition_passes(condition, parent_out):
+                    should_skip = True
+                    break
+
+        if should_skip:
+            skipped_nodes.add(nid)
+            log_entry = {
+                "node_id": nid,
+                "node_label": label,
+                "type": node_type,
+                "status": "skipped",
+                "message": f"⏭️ Skipped — condition not met",
+                "duration": "0.0s",
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+            logs.append(log_entry)
+            if on_node_complete:
+                await on_node_complete(log_entry)
+            continue
+
+        parent_outputs = [
+            node_outputs[e["source"]]
+            for e in edges
+            if e["target"] == nid and e["source"] in node_outputs
+        ]
+        node_context = {
+            **context,
+            "parent_outputs": parent_outputs,
+            "all_node_outputs": node_outputs,
+            "edges": edges,
+            "current_node_id": nid,
+        }
+
+        t_start = datetime.now(timezone.utc)
+        try:
+            result = await _execute_node(node_type, node_data, user_id, integrations, node_context)
+            node_outputs[nid] = result
+            duration = f"{(datetime.now(timezone.utc) - t_start).total_seconds():.1f}s"
+            log_entry = {
+                "node_id": nid,
+                "node_label": label,
+                "type": node_type,
+                "status": "success",
+                "message": result,
+                "duration": duration,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+            logs.append(log_entry)
+            if on_node_complete:
+                await on_node_complete(log_entry)
+        except Exception as e:
+            status = "failed"
+            duration = f"{(datetime.now(timezone.utc) - t_start).total_seconds():.1f}s"
+            log_entry = {
+                "node_id": nid,
+                "node_label": label,
+                "type": node_type,
+                "status": "failed",
+                "message": str(e),
+                "duration": duration,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+            logs.append(log_entry)
+            if on_node_complete:
+                await on_node_complete(log_entry)
+            break
+
+    end = datetime.now(timezone.utc)
+    secs = (end - start).total_seconds()
+    return {
+        "status": status,
+        "duration": f"{int(secs // 60)}m {int(secs % 60)}s" if secs >= 60 else f"{secs:.1f}s",
+        "logs": logs,
+        "started_at": start.isoformat(),
+        "finished_at": end.isoformat()
+    }
