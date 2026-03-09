@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
+from datetime import datetime
 from app.auth import get_current_user
 from app.database import supabase
 from app.config import settings as app_settings
@@ -337,3 +338,16 @@ async def get_repo_tree(
         "count": len(files),
         "truncated": len(files) > 50
     })
+
+
+@router.post("/select-repo")
+async def select_repo(body: dict, user: dict = Depends(get_current_user)):
+    repo_full_name = body.get("repo_full_name")
+    if not repo_full_name:
+        raise HTTPException(status_code=400, detail="No repo provided")
+    supabase.table("user_settings").upsert({
+        "user_id": user["user_id"],
+        "selected_repo_full_name": repo_full_name,
+        "updated_at": datetime.utcnow().isoformat()
+    }, on_conflict="user_id").execute()
+    return {"saved": True}
