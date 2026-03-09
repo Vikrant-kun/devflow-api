@@ -208,7 +208,6 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
 def _get_all_ancestor_outputs(node_id: str, edges: list, all_node_outputs: dict) -> str:
     """Walk the full ancestor chain and return all outputs as one string."""
     if not node_id or not edges or not all_node_outputs:
-        # Fallback: just return everything we have
         return " ".join(str(v) for v in all_node_outputs.values())
     visited = set()
     queue = [node_id]
@@ -224,7 +223,6 @@ def _get_all_ancestor_outputs(node_id: str, edges: list, all_node_outputs: dict)
                 all_outputs.append(str(all_node_outputs[parent_id]))
             if parent_id not in visited:
                 queue.append(parent_id)
-    # If we found nothing via ancestor walk, return ALL outputs as fallback
     if not all_outputs:
         return " ".join(str(v) for v in all_node_outputs.values())
     return " ".join(all_outputs)
@@ -252,16 +250,14 @@ async def _execute_node(node_type: str, node_data: dict, user_id: str, integrati
             edges = context.get("edges", [])
             current_node_id = context.get("current_node_id", "")
             print(f"DEBUG EMAIL NODE: label={label!r} | current_node_id={current_node_id!r} | all_outputs_keys={list(all_node_outputs.keys())}")
-            # Get ALL ancestor outputs — with fallback to everything if walk fails
             ancestor_text = _get_all_ancestor_outputs(current_node_id, edges, all_node_outputs)
             print(f"DEBUG ANCESTOR TEXT: {ancestor_text[:300]!r}")
-            # Ground truth — these come from our own code, not AI
+
             code_was_fixed = "✅ Fixed and committed" in ancestor_text
             code_was_clean = ("✅ No issues found" in ancestor_text or
                               "no changes needed" in ancestor_text.lower())
             print(f"DEBUG: code_was_fixed={code_was_fixed} | code_was_clean={code_was_clean}")
-            # Determine final state
-            # If BOTH appear (multiple nodes ran), fixed wins over clean
+
             if code_was_fixed:
                 has_errors = True
                 is_clean = False
@@ -269,7 +265,6 @@ async def _execute_node(node_type: str, node_data: dict, user_id: str, integrati
                 has_errors = False
                 is_clean = True
             else:
-                # No code edit nodes in ancestors — check direct parent text
                 parent_outputs = context.get("parent_outputs", [])
                 parent_text = " ".join(str(o) for o in parent_outputs).lower()
                 number_match = re.search(
@@ -279,31 +274,45 @@ async def _execute_node(node_type: str, node_data: dict, user_id: str, integrati
                 has_errors = bool(number_match)
                 is_clean = not has_errors and any(k in parent_text for k in [
                     "no error", "no bug", "no issue", "no syntax error",
-                    "nothing found", "all clear", "no problems"
+                    "nothing found", "all clear", "no problems", "clean", "passed"
                 ])
-            # Classify this email node's intent
+
             node_text = (label + " " + description).lower()
+
+            # Stricter classification — follow strict naming rules
             is_error_email = any(k in node_text for k in [
-                "fix", "fixed", "error", "bug", "issue", "alert",
-                "fail", "problem", "found", "detected", "vulnerab"
-            ])
+                "error alert", "fix needed", "issues detected", "pipeline failed",
+                "fix", "alert", "fail", "problem", "detected"
+            ]) and not any(k in node_text for k in ["no ", "all clear", "succeeded", "passed"])
+
             is_no_error_email = any(k in node_text for k in [
-                "no error", "no bug", "no issue", "clean", "clear",
-                "all good", "passed", "no errors", "no problem"
-            ])
+                "all clear", "no issues found", "pipeline succeeded",
+                "all clear", "no issues", "succeeded", "clean", "passed"
+            ]) and "error" not in node_text and "issue" not in node_text and "bug" not in node_text
+
+            # Safety: if both are somehow true, prefer error branch + log
+            if is_error_email and is_no_error_email:
+                print(f"WARNING: Email node '{label}' matched BOTH error AND no-error intent — defaulting to error branch")
+                is_no_error_email = False
+
             print(f"DEBUG: is_error_email={is_error_email} | is_no_error_email={is_no_error_email} | has_errors={has_errors} | is_clean={is_clean}")
-            # No signal either way — just send
+
             if not has_errors and not is_clean:
                 return await _execute_email(node_data, context)
+
             if is_error_email and not is_no_error_email:
                 if is_clean and not has_errors:
                     return f"⏭️ Skipped '{node_data.get('label')}' — no errors found, error alert not needed"
                 return await _execute_email(node_data, context)
+
             elif is_no_error_email and not is_error_email:
                 if has_errors and not is_clean:
                     return f"⏭️ Skipped '{node_data.get('label')}' — errors were found, no-error email not needed"
                 return await _execute_email(node_data, context)
+
             else:
+                # Should now be very rare — send anyway
+                print(f"DEBUG: Ambiguous email intent for '{label}' — sending anyway")
                 return await _execute_email(node_data, context)
 
         # ── Code edit / fix / refactor ────────────────────────────────────
@@ -440,14 +449,14 @@ async def execute_workflow(nodes: list, edges: list, user_id: str, context: dict
     if not roots:
         roots = [nodes[0]["id"]] if nodes else []
 
-    visited, queue, seen = [], list(roots), set()
-    while queue:
-        nid = queue.pop(0)
+    visited, stack, seen = [], list(roots), set()
+    while stack:
+        nid = stack.pop()
         if nid in seen:
             continue
         seen.add(nid)
         visited.append(nid)
-        queue.extend(adj.get(nid, []))
+        stack.extend(reversed(adj.get(nid, [])))
 
     node_outputs = {}
 
@@ -532,14 +541,14 @@ async def execute_workflow_ws(
     if not roots:
         roots = [nodes[0]["id"]] if nodes else []
 
-    visited, queue, seen = [], list(roots), set()
-    while queue:
-        nid = queue.pop(0)
+    visited, stack, seen = [], list(roots), set()
+    while stack:
+        nid = stack.pop()
         if nid in seen:
             continue
         seen.add(nid)
         visited.append(nid)
-        queue.extend(adj.get(nid, []))
+        stack.extend(reversed(adj.get(nid, [])))
 
     node_outputs = {}
 
@@ -698,19 +707,14 @@ async def _execute_linear(node_data: dict, integrations: dict, context: dict) ->
     description = node_data.get("description", "") or parent_output
 
     async with httpx.AsyncClient() as client:
-        res = await client.post(
-            "https://api.linear.app/graphql",
+        res = await client.post("https://api.linear.app/graphql",
             headers={"Authorization": token, "Content-Type": "application/json"},
-            json={
-                "query": """mutation CreateIssue($title: String!, $description: String) {
-                    issueCreate(input: {title: $title, description: $description}) {
-                        success issue { id title url }
-                    }
-                }""",
-                "variables": {"title": label, "description": description}
-            },
-            timeout=10.0
-        )
+            json={"query": """mutation CreateIssue($title: String!, $description: String) {
+                issueCreate(input: {title: $title, description: $description}) {
+                    success issue { id title url }
+                }
+            }""", "variables": {"title": label, "description": description}},
+            timeout=10.0)
         res.raise_for_status()
         data = res.json()
         issue = data.get("data", {}).get("issueCreate", {}).get("issue", {})
@@ -744,21 +748,15 @@ async def _execute_jira(node_data: dict, integrations: dict, context: dict) -> s
 
         project_key = project_list[0]["key"]
 
-        res = await client.post(
-            f"https://{domain}/rest/api/3/issue",
-            headers=headers,
-            json={
-                "fields": {
-                    "project": {"key": project_key},
-                    "summary": label,
-                    "description": {"type": "doc", "version": 1, "content": [
-                        {"type": "paragraph", "content": [{"type": "text", "text": description or label}]}
-                    ]},
-                    "issuetype": {"name": "Task"}
-                }
-            },
-            timeout=10.0
-        )
+        res = await client.post(f"https://{domain}/rest/api/3/issue", headers=headers,
+            json={"fields": {
+                "project": {"key": project_key},
+                "summary": label,
+                "description": {"type": "doc", "version": 1, "content": [
+                    {"type": "paragraph", "content": [{"type": "text", "text": description or label}]}
+                ]},
+                "issuetype": {"name": "Task"}
+            }}, timeout=10.0)
         res.raise_for_status()
         issue = res.json()
 
