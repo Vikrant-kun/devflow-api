@@ -331,74 +331,30 @@ async def _execute_node(node_type: str, node_data: dict, user_id: str, integrati
         intent = await _classify_node_intent(label, description)
 
         if intent == "email":
-            node_email = node_data.get("email", "")
-            all_node_outputs = context.get("all_node_outputs", {})
-            edges = context.get("edges", [])
-            current_node_id = context.get("current_node_id", "")
-            print(f"DEBUG EMAIL NODE: label={label!r} | current_node_id={current_node_id!r} | all_outputs_keys={list(all_node_outputs.keys())}")
-            ancestor_text = _get_all_ancestor_outputs(current_node_id, edges, all_node_outputs)
-            print(f"DEBUG ANCESTOR TEXT: {ancestor_text[:300]!r}")
-
+            ancestor_text = _get_all_ancestor_outputs(
+                context.get("current_node_id", ""),
+                context.get("edges", []),
+                context.get("all_node_outputs", {})
+            )
             code_was_fixed = "✅ Fixed and committed" in ancestor_text
-            code_was_clean = ("✅ No issues found" in ancestor_text or
-                              "no changes needed" in ancestor_text.lower())
-            print(f"DEBUG: code_was_fixed={code_was_fixed} | code_was_clean={code_was_clean}")
+            code_was_clean = "✅ No issues found" in ancestor_text or "no changes needed" in ancestor_text.lower()
 
-            if code_was_fixed:
-                has_errors = True
-                is_clean = False
-            elif code_was_clean:
-                has_errors = False
-                is_clean = True
-            else:
-                parent_outputs = context.get("parent_outputs", [])
-                parent_text = " ".join(str(o) for o in parent_outputs).lower()
-                number_match = re.search(
-                    r'\b([1-9]\d*)\s+(error|bug|issue|vulnerabilit|problem|warning)',
-                    parent_text
-                )
-                has_errors = bool(number_match)
-                is_clean = not has_errors and any(k in parent_text for k in [
-                    "no error", "no bug", "no issue", "no syntax error",
-                    "nothing found", "all clear", "no problems", "clean", "passed"
-                ])
-
+            # Use AI to decide if this is an error email or success email
             node_text = (label + " " + description).lower()
-
-            # Stricter classification — follow strict naming rules
-            is_error_email = any(k in node_text for k in [
-                "error alert", "fix needed", "issues detected", "pipeline failed",
-                "fix", "alert", "fail", "problem", "detected"
-            ]) and not any(k in node_text for k in ["no ", "all clear", "succeeded", "passed"])
-
-            is_no_error_email = any(k in node_text for k in [
-                "all clear", "no issues found", "pipeline succeeded",
-                "all clear", "no issues", "succeeded", "clean", "passed"
-            ]) and "error" not in node_text and "issue" not in node_text and "bug" not in node_text
-
-            # Safety: if both are somehow true, prefer error branch + log
-            if is_error_email and is_no_error_email:
-                print(f"WARNING: Email node '{label}' matched BOTH error AND no-error intent — defaulting to error branch")
-                is_no_error_email = False
-
-            print(f"DEBUG: is_error_email={is_error_email} | is_no_error_email={is_no_error_email} | has_errors={has_errors} | is_clean={is_clean}")
-
-            if not has_errors and not is_clean:
-                return await _execute_email(node_data, context)
+            is_error_email = any(k in node_text for k in ["error", "alert", "fail", "problem", "issue", "bug"])
+            is_no_error_email = any(k in node_text for k in ["success", "all clear", "no issue", "clean", "passed", "succeeded"])
 
             if is_error_email and not is_no_error_email:
-                if is_clean and not has_errors:
-                    return f"⏭️ Skipped '{node_data.get('label')}' — no errors found, error alert not needed"
+                if code_was_clean and not code_was_fixed:
+                    return f"⏭️ Skipped '{label}' — no errors found"
                 return await _execute_email(node_data, context)
 
             elif is_no_error_email and not is_error_email:
-                if has_errors and not is_clean:
-                    return f"⏭️ Skipped '{node_data.get('label')}' — errors were found, no-error email not needed"
+                if code_was_fixed and not code_was_clean:
+                    return f"⏭️ Skipped '{label}' — errors were found"
                 return await _execute_email(node_data, context)
 
             else:
-                # Should now be very rare — send anyway
-                print(f"DEBUG: Ambiguous email intent for '{label}' — sending anyway")
                 return await _execute_email(node_data, context)
 
         elif intent == "ai_code_edit":
