@@ -76,7 +76,9 @@ async def _execute_email(node_data: dict, context: dict) -> str:
     msg.attach(MIMEText(html, "html"))
 
     import smtplib
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+    with smtplib.SMTP("smtp.gmail.com", 587) as smtp:
+        smtp.ehlo()
+        smtp.starttls()
         smtp.login(settings.GMAIL_USER, settings.GMAIL_APP_PASSWORD)
         smtp.sendmail(settings.GMAIL_USER, to_email, msg.as_string())
     return f"✅ Email sent to {to_email}"
