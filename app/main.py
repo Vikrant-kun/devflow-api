@@ -6,7 +6,8 @@ from app.routes import workflows, runs, health, github, webhooks, ws
 app = FastAPI(
     title="DevFlow API",
     description="Backend for DevFlow AI — workflow automation platform",
-    version="1.0.0"
+    version="1.0.0",
+    redirect_slashes=False
 )
 
 # ── CORS ─────────────────────────────────────────────────────────
