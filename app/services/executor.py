@@ -225,36 +225,38 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
 
 
 # ── Helper: evaluate a conditional edge ──────────────────────────────
-def _edge_condition_passes(condition: str, parent_output: str) -> bool:
-    if not condition or condition == "always":
+async def _evaluate_condition(condition: str, parent_output: str) -> bool:
+    """Use AI to evaluate if a condition passes based on parent output."""
+    if not condition or condition in ("always", ""):
         return True
 
-    out = parent_output.lower().strip()
+    prompt = f"""You are a workflow condition evaluator.
 
-    # Semantic success signals
-    success_signals = [
-        "no issues found", "no changes needed", "no errors", "no bugs",
-        "all clear", "clean", "passed", "nothing found", "no problems",
-        "no syntax error", "✅ no issues"
-    ]
+Parent node output:
+"{parent_output}"
 
-    # Semantic error signals  
-    error_signals = [
-        "✅ fixed and committed", "fixed and committed", "errors found",
-        "bugs found", "issues found", "syntax error", "failed", "exception"
-    ]
+Edge condition to evaluate:
+"{condition}"
 
-    has_errors = any(s in out for s in error_signals)
-    is_clean = any(s in out for s in success_signals) and not has_errors
+Does the parent output satisfy this condition? 
+Reply with ONLY: true or false"""
 
-    if condition == "errors_found":
-        return has_errors
-
-    if condition == "no_errors":
-        return is_clean or not has_errors
-
-    # Semantic fallback for free-text conditions
-    return True  # unknown condition → always pass
+    async with httpx.AsyncClient() as client:
+        res = await client.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 5,
+                "temperature": 0
+            },
+            timeout=10.0
+        )
+        if res.status_code == 200:
+            answer = res.json()["choices"][0]["message"]["content"].strip().lower()
+            return answer == "true"
+    return True  # safe fallback
 
 
 # ── Helper: Get all ancestor outputs ─────────────────────────────────────────
@@ -339,7 +341,12 @@ async def _execute_node(node_type: str, node_data: dict, user_id: str, integrati
                 context.get("all_node_outputs", {})
             )
             code_was_fixed = "✅ Fixed and committed" in ancestor_text
-            code_was_clean = "✅ No issues found" in ancestor_text or "no changes needed" in ancestor_text.lower()
+            code_was_clean = (
+    "✅ No issues found" in ancestor_text or
+    "no issues found" in ancestor_text.lower() or
+    "no changes needed" in ancestor_text.lower() or
+    "✅ no" in ancestor_text.lower()
+)
 
             # Use AI to decide if this is an error email or success email
             node_text = (label + " " + description).lower()
@@ -656,7 +663,7 @@ async def execute_workflow(nodes: list, edges: list, user_id: str, context: dict
             # If there's a condition, evaluate it against parent output
             if condition and condition != "always":
                 parent_out = node_outputs.get(source_id, "")
-                if not _edge_condition_passes(condition, parent_out):
+                if not await _evaluate_condition(condition, parent_out):
                     should_skip = True
                     break
 
@@ -794,7 +801,7 @@ async def execute_workflow_ws(
 
             if condition and condition != "always":
                 parent_out = node_outputs.get(source_id, "")
-                if not _edge_condition_passes(condition, parent_out):
+                if not await _evaluate_condition(condition, parent_out):
                     should_skip = True
                     break
 
