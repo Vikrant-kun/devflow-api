@@ -35,14 +35,35 @@ async def _execute_email(node_data: dict, context: dict) -> str:
 
     body = parent_output or description or f"DevFlow pipeline step '{label}' completed."
 
+    # Parse body for sections
+    lines = body.split('\n')
+    commit_url = next((w for line in lines for w in line.split() if 'github.com' in w and 'commit' in w), None)
+    files_changed = [l.strip() for l in lines if any(l.strip().startswith(p) for p in ['- ', '✅', '📁', 'Modified', 'Changed', 'Fixed'])]
+    status_emoji = '✅' if any(w in body.lower() for w in ['fixed', 'success', 'no issues', 'clean']) else '⚠️'
+
+    files_html = ''.join(f'<div style="padding:4px 0;border-bottom:1px solid #1A1A1A;color:#94A3B8;font-size:11px;">📁 {f}</div>' for f in files_changed[:10]) if files_changed else ''
+    commit_html = f'<a href="{commit_url}" style="color:#6EE7B7;font-size:11px;">🔗 View Commit →</a>' if commit_url else ''
+
     html = f"""
-    <div style="font-family:monospace;background:#080808;color:#F1F5F9;padding:24px;border-radius:12px;">
-        <h2 style="color:#6EE7B7;margin-bottom:16px;">⚡ DevFlow Pipeline Notification</h2>
-        <p style="color:#64748B;font-size:12px;">Step: <strong style="color:#F1F5F9">{label}</strong></p>
-        <div style="background:#111;border:1px solid #222;border-radius:8px;padding:16px;margin-top:12px;">
-            <pre style="color:#F1F5F9;font-size:12px;white-space:pre-wrap;">{body}</pre>
+    <div style="font-family:monospace;background:#080808;color:#F1F5F9;padding:28px;border-radius:16px;max-width:600px;margin:0 auto;">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:20px;">
+            <span style="font-size:24px;">{status_emoji}</span>
+            <div>
+                <h2 style="color:#6EE7B7;margin:0;font-size:16px;">DevFlow Pipeline</h2>
+                <p style="color:#64748B;margin:2px 0 0;font-size:11px;">Step: {label}</p>
+            </div>
         </div>
-        <p style="color:#333;font-size:10px;margin-top:16px;">Sent by DevFlow AI</p>
+
+        <div style="background:#111;border:1px solid #222;border-radius:10px;padding:16px;margin-bottom:16px;">
+            <p style="color:#444;font-size:9px;uppercase;letter-spacing:2px;margin:0 0 10px;">PIPELINE OUTPUT</p>
+            <pre style="color:#F1F5F9;font-size:11px;white-space:pre-wrap;margin:0;line-height:1.6;">{body}</pre>
+        </div>
+
+        {f'<div style="background:#111;border:1px solid #222;border-radius:10px;padding:16px;margin-bottom:16px;"><p style="color:#444;font-size:9px;letter-spacing:2px;margin:0 0 10px;">FILES CHANGED</p>{files_html}</div>' if files_html else ''}
+
+        {f'<div style="margin-bottom:16px;">{commit_html}</div>' if commit_html else ''}
+
+        <p style="color:#333;font-size:10px;margin:0;border-top:1px solid #1A1A1A;padding-top:12px;">Sent by DevFlow AI · pipeline automation</p>
     </div>
     """
 
