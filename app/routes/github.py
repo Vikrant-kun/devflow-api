@@ -321,3 +321,26 @@ async def select_repo(body: dict, user: dict = Depends(get_current_user)):
     )
 
     return {"saved": True}
+
+@router.get("/integration-settings")
+async def get_integration_settings(user=Depends(get_current_user)):
+    settings = query_one(
+        "SELECT slack_webhook_url, notion_token, linear_token, jira_token, jira_domain FROM user_settings WHERE user_id = %s",
+        (user["user_id"],)
+    )
+    return settings or {}
+
+@router.post("/integration-settings")
+async def save_integration_settings(data: dict, user=Depends(get_current_user)):
+    fields = ["slack_webhook_url", "notion_token", "linear_token", "jira_token", "jira_domain"]
+    updates = {k: v for k, v in data.items() if k in fields}
+    if not updates:
+        return {"ok": True}
+    set_clause = ", ".join(f"{k} = %s" for k in updates)
+    values = list(updates.values()) + [user["user_id"]]
+    query(f"""
+        INSERT INTO user_settings (user_id, {', '.join(updates.keys())})
+        VALUES (%s, {', '.join(['%s']*len(updates))})
+        ON CONFLICT (user_id) DO UPDATE SET {set_clause}
+    """, [user["user_id"]] + list(updates.values()))
+    return {"ok": True}
