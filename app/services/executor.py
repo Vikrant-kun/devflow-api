@@ -256,7 +256,7 @@ def _edge_condition_passes(condition: str, parent_output: str) -> bool:
 
 
 # ── Helper: Get all ancestor outputs ─────────────────────────────────────────
-async def _get_all_ancestor_outputs(node_id: str, edges: list, all_node_outputs: dict) -> str:
+def _get_all_ancestor_outputs(node_id: str, edges: list, all_node_outputs: dict) -> str:
     """Walk the full ancestor chain and return all outputs as one string."""
     if not node_id or not edges or not all_node_outputs:
         return " ".join(str(v) for v in all_node_outputs.values())
