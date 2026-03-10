@@ -291,6 +291,19 @@ async def delete_repo(owner: str, repo: str, user: dict = Depends(get_current_us
 # -----------------------------
 # SELECT REPO
 # -----------------------------
+
+@router.get("/selected-repo")
+async def get_selected_repo(user: dict = Depends(get_current_user)):
+    row = query_one(
+        "SELECT selected_repo_full_name FROM user_settings WHERE user_id = %s",
+        (user["user_id"],)
+    )
+
+    if not row or not row.get("selected_repo_full_name"):
+        return {"repo": None}
+
+    return {"repo": {"full_name": row["selected_repo_full_name"]}}
+
 @router.post("/select-repo")
 async def select_repo(body: dict, user: dict = Depends(get_current_user)):
 
