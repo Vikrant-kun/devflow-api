@@ -69,19 +69,24 @@ async def _execute_email(node_data: dict, context: dict) -> str:
     </div>
     """
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"DevFlow Pipeline: {label}"
-    msg["From"] = f"DevFlow <{settings.GMAIL_USER}>"
-    msg["To"] = to_email
-    msg.attach(MIMEText(html, "html"))
-
-    import smtplib
-    with smtplib.SMTP("smtp.gmail.com", 587) as smtp:
-        smtp.ehlo()
-        smtp.starttls()
-        smtp.login(settings.GMAIL_USER, settings.GMAIL_APP_PASSWORD)
-        smtp.sendmail(settings.GMAIL_USER, to_email, msg.as_string())
-    return f"✅ Email sent to {to_email}"
+    async with httpx.AsyncClient() as client:
+        res = await client.post(
+            "https://api.brevo.com/v3/smtp/email",
+            headers={
+                "api-key": settings.BREVO_API_KEY,
+                "Content-Type": "application/json"
+            },
+            json={
+                "sender": {"name": "DevFlow AI", "email": settings.GMAIL_USER},
+                "to": [{"email": to_email}],
+                "subject": f"DevFlow Pipeline: {label}",
+                "htmlContent": html
+            },
+            timeout=15.0
+        )
+        if res.status_code in (200, 201):
+            return f"✅ Email sent to {to_email}"
+        raise Exception(f"Email failed: {res.status_code} {res.text}")
 
 
 # ── AI Code Edit executor ────────────────────────────────────────────────────
