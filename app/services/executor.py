@@ -75,14 +75,10 @@ async def _execute_email(node_data: dict, context: dict) -> str:
     msg["To"] = to_email
     msg.attach(MIMEText(html, "html"))
 
-    def send():
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-            smtp.login(settings.GMAIL_USER, settings.GMAIL_APP_PASSWORD)
-            smtp.sendmail(settings.GMAIL_USER, to_email, msg.as_string())
-
-    import asyncio
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, send)
+    import smtplib
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+        smtp.login(settings.GMAIL_USER, settings.GMAIL_APP_PASSWORD)
+        smtp.sendmail(settings.GMAIL_USER, to_email, msg.as_string())
     return f"✅ Email sent to {to_email}"
 
 
