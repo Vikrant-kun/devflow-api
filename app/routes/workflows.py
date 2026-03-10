@@ -54,6 +54,11 @@ async def delete_workflow(workflow_id: str, user: dict = Depends(get_current_use
     query("DELETE FROM workflows WHERE id=%s AND user_id=%s", (workflow_id, user["user_id"]))
     return {"deleted": True}
 
+@router.delete("/")
+async def delete_all_workflows(user: dict = Depends(get_current_user)):
+    query("DELETE FROM workflows WHERE user_id=%s", (user["user_id"],))
+    return {"deleted": True}
+
 @router.post("/run")
 async def run_workflow(body: RunWorkflowRequest, user: dict = Depends(get_current_user)):
     prompt_val = getattr(body.snapshot, "prompt", "")
