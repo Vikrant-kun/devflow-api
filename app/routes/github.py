@@ -337,10 +337,48 @@ async def save_integration_settings(data: dict, user=Depends(get_current_user)):
     if not updates:
         return {"ok": True}
     set_clause = ", ".join(f"{k} = %s" for k in updates)
-    values = list(updates.values()) + [user["user_id"]]
     query(f"""
         INSERT INTO user_settings (user_id, {', '.join(updates.keys())})
         VALUES (%s, {', '.join(['%s']*len(updates))})
         ON CONFLICT (user_id) DO UPDATE SET {set_clause}
     """, [user["user_id"]] + list(updates.values()))
     return {"ok": True}
+
+@router.get("/branches/")
+async def get_branches(user: dict = Depends(get_current_user)):
+
+    token = get_github_token(user)
+
+    repo = query_one(
+        "SELECT selected_repo_full_name FROM user_settings WHERE user_id = %s",
+        (user["user_id"],)
+    )
+
+    if not repo or not repo["selected_repo_full_name"]:
+        raise HTTPException(status_code=400, detail="No repository selected")
+
+    repo_full_name = repo["selected_repo_full_name"]
+
+    client = get_github_client()
+
+    res = await client.get(
+        f"https://api.github.com/repos/{repo_full_name}/branches",
+        headers={"Authorization": f"Bearer {token}"}
+    )
+
+    check_rate_limit(res)
+
+    if res.status_code != 200:
+        raise HTTPException(status_code=res.status_code, detail="Failed to fetch branches")
+
+    branches = [
+    {
+        "name": b["name"],
+        "commit_sha": b["commit"]["sha"],
+        "protected": b.get("protected", False),
+        "is_default": b["name"] == "main"
+    }
+    for b in res.json()
+]
+
+    return {"branches": branches}
