@@ -17,6 +17,10 @@ async def get_user_integrations(user_id: str) -> dict:
 
 # ── Email executor ────────────────────────────────────────────────
 async def _execute_email(node_data: dict, context: dict) -> str:
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+
     label = node_data.get("label", "")
     description = node_data.get("description", "")
     parent_output = "\n".join(context.get("parent_outputs", []))
@@ -31,33 +35,30 @@ async def _execute_email(node_data: dict, context: dict) -> str:
 
     body = parent_output or description or f"DevFlow pipeline step '{label}' completed."
 
-    async with httpx.AsyncClient() as client:
-        res = await client.post(
-            "https://api.resend.com/emails",
-            headers={
-                "Authorization": f"Bearer {settings.RESEND_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "from": "DevFlow <onboarding@resend.dev>",
-                "to": [to_email],
-                "subject": f"DevFlow Pipeline: {label}",
-                "html": f"""
-                <div style="font-family:monospace;background:#080808;color:#F1F5F9;padding:24px;border-radius:12px;">
-                    <h2 style="color:#6EE7B7;margin-bottom:16px;">⚡ DevFlow Pipeline Notification</h2>
-                    <p style="color:#64748B;font-size:12px;">Step: <strong style="color:#F1F5F9">{label}</strong></p>
-                    <div style="background:#111;border:1px solid #222;border-radius:8px;padding:16px;margin-top:12px;">
-                        <pre style="color:#F1F5F9;font-size:12px;white-space:pre-wrap;">{body}</pre>
-                    </div>
-                    <p style="color:#333;font-size:10px;margin-top:16px;">Sent by DevFlow AI · devflow.ai</p>
-                </div>
-                """
-            },
-            timeout=10.0
-        )
-        if res.status_code in [200, 201]:
-            return f"Email sent to {to_email}"
-        raise Exception(f"Email failed: {res.json().get('message', res.status_code)}")
+    html = f"""
+    <div style="font-family:monospace;background:#080808;color:#F1F5F9;padding:24px;border-radius:12px;">
+        <h2 style="color:#6EE7B7;margin-bottom:16px;">⚡ DevFlow Pipeline Notification</h2>
+        <p style="color:#64748B;font-size:12px;">Step: <strong style="color:#F1F5F9">{label}</strong></p>
+        <div style="background:#111;border:1px solid #222;border-radius:8px;padding:16px;margin-top:12px;">
+            <pre style="color:#F1F5F9;font-size:12px;white-space:pre-wrap;">{body}</pre>
+        </div>
+        <p style="color:#333;font-size:10px;margin-top:16px;">Sent by DevFlow AI</p>
+    </div>
+    """
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = f"DevFlow Pipeline: {label}"
+    msg["From"] = f"DevFlow <{settings.GMAIL_USER}>"
+    msg["To"] = to_email
+    msg.attach(MIMEText(html, "html"))
+
+    def send():
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+            smtp.login(settings.GMAIL_USER, settings.GMAIL_APP_PASSWORD)
+            smtp.sendmail(settings.GMAIL_USER, to_email, msg.as_string())
+
+    await asyncio.get_event_loop().run_in_executor(None, send)
+    return f"✅ Email sent to {to_email}"
 
 
 # ── AI Code Edit executor ────────────────────────────────────────────────────
