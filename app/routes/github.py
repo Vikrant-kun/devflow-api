@@ -142,7 +142,7 @@ async def get_user_settings(user: dict = Depends(get_current_user)):
 # -----------------------------
 # LIST REPOS WITH CACHE
 # -----------------------------
-@router.get("/repos")
+@router.get("/repos/")
 async def list_repos(user: dict = Depends(get_current_user)):
 
     cached = _repo_cache.get(user["user_id"])
@@ -183,7 +183,7 @@ async def list_repos(user: dict = Depends(get_current_user)):
 # -----------------------------
 # CREATE REPO
 # -----------------------------
-@router.post("/repos")
+@router.post("/repos/")
 async def create_repo(body: CreateRepoRequest, user: dict = Depends(get_current_user)):
 
     token = get_github_token(user)
@@ -222,7 +222,7 @@ async def create_repo(body: CreateRepoRequest, user: dict = Depends(get_current_
 # -----------------------------
 # COMMIT FILE
 # -----------------------------
-@router.post("/commit")
+@router.post("/commit/")
 async def commit_file(body: CommitFileRequest, user: dict = Depends(get_current_user)):
 
     token = get_github_token(user)
@@ -292,7 +292,7 @@ async def delete_repo(owner: str, repo: str, user: dict = Depends(get_current_us
 # SELECT REPO
 # -----------------------------
 
-@router.get("/selected-repo")
+@router.get("/selected-repo/")
 async def get_selected_repo(user: dict = Depends(get_current_user)):
     row = query_one(
         "SELECT selected_repo_full_name FROM user_settings WHERE user_id = %s",
@@ -304,7 +304,7 @@ async def get_selected_repo(user: dict = Depends(get_current_user)):
 
     return {"repo": {"full_name": row["selected_repo_full_name"]}}
 
-@router.post("/select-repo")
+@router.post("/select-repo/")
 async def select_repo(body: dict, user: dict = Depends(get_current_user)):
 
     repo_full_name = body.get("repo_full_name")
@@ -322,7 +322,7 @@ async def select_repo(body: dict, user: dict = Depends(get_current_user)):
 
     return {"saved": True}
 
-@router.get("/integration-settings")
+@router.get("/integration-settings/")
 async def get_integration_settings(user=Depends(get_current_user)):
     settings = query_one(
         "SELECT slack_webhook_url, notion_token, linear_token, jira_token, jira_domain FROM user_settings WHERE user_id = %s",
@@ -330,7 +330,7 @@ async def get_integration_settings(user=Depends(get_current_user)):
     )
     return settings or {}
 
-@router.post("/integration-settings")
+@router.post("/integration-settings/")
 async def save_integration_settings(data: dict, user=Depends(get_current_user)):
     fields = ["slack_webhook_url", "notion_token", "linear_token", "jira_token", "jira_domain"]
     updates = {k: v for k, v in data.items() if k in fields}
