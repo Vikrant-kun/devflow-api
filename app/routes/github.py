@@ -187,6 +187,18 @@ async def select_repo(body: dict, user: dict = Depends(get_current_user)):
     return {"saved": True}
 
 
+@router.get("/selected-repo")
+async def get_selected_repo(user: dict = Depends(get_current_user)):
+    row = query_one(
+        "SELECT selected_repo_full_name FROM user_settings WHERE user_id = %s",
+        (user["user_id"],)
+    )
+    if not row or not row.get("selected_repo_full_name"):
+        return {"repo": None}
+    full_name = row["selected_repo_full_name"]
+    return {"repo": {"name": full_name.split("/")[1], "full_name": full_name}}
+
+
 @router.get("/branches")
 async def list_branches(user: dict = Depends(get_current_user)):
     token = get_github_token(user)
