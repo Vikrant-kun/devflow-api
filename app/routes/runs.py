@@ -1,52 +1,31 @@
 from fastapi import APIRouter, Depends, HTTPException
 from app.auth import get_current_user
-from app.database import supabase
+from app.database import query, query_one
 
 router = APIRouter(prefix="/runs", tags=["runs"])
 
-
-# ── GET /runs — all runs for user ────────────────────────────────
 @router.get("/")
 async def list_runs(user: dict = Depends(get_current_user)):
-    result = (
-        supabase.table("workflow_runs")
-        .select("*")
-        .eq("user_id", user["user_id"])
-        .order("started_at", desc=True)
-        .limit(50)
-        .execute()
+    rows = query(
+        "SELECT * FROM workflow_runs WHERE user_id = %s ORDER BY started_at DESC LIMIT 50",
+        (user["user_id"],)
     )
-    return {"runs": result.data}
+    return {"runs": rows}
 
-
-# ── GET /runs/:id — single run with snapshot for replay ──────────
 @router.get("/{run_id}")
 async def get_run(run_id: str, user: dict = Depends(get_current_user)):
-    result = (
-        supabase.table("workflow_runs")
-        .select("*")
-        .eq("id", run_id)
-        .eq("user_id", user["user_id"])
-        .single()
-        .execute()
+    row = query_one(
+        "SELECT * FROM workflow_runs WHERE id = %s AND user_id = %s",
+        (run_id, user["user_id"])
     )
-    if not result.data:
+    if not row:
         raise HTTPException(status_code=404, detail="Run not found")
-    return result.data
+    return row
 
-
-# ── GET /runs/workflow/:workflow_id — runs for a specific workflow
 @router.get("/workflow/{workflow_id}")
-async def runs_for_workflow(
-    workflow_id: str,
-    user: dict = Depends(get_current_user)
-):
-    result = (
-        supabase.table("workflow_runs")
-        .select("*")
-        .eq("workflow_id", workflow_id)
-        .eq("user_id", user["user_id"])
-        .order("started_at", desc=True)
-        .execute()
+async def runs_for_workflow(workflow_id: str, user: dict = Depends(get_current_user)):
+    rows = query(
+        "SELECT * FROM workflow_runs WHERE workflow_id = %s AND user_id = %s ORDER BY started_at DESC",
+        (workflow_id, user["user_id"])
     )
-    return {"runs": result.data}
+    return {"runs": rows}

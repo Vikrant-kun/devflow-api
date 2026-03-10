@@ -1,5 +1,5 @@
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from app.database import supabase
+from app.database import query
 from app.services.executor import execute_workflow_ws
 import json
 
@@ -26,17 +26,13 @@ async def websocket_run(websocket: WebSocket, user_id: str):
             on_node_complete=on_node_update
         )
 
-        supabase.table("workflow_runs").insert({
-            "user_id": user_id,
-            "workflow_id": workflow_id,
-            "workflow_name": workflow_name,
-            "status": result["status"],
-            "started_at": result["started_at"],
-            "duration": result["duration"],
-            "triggered_by": "manual",
-            "snapshot": snapshot,
-            "logs": result["logs"]
-        }).execute()
+        query(
+            """INSERT INTO workflow_runs (user_id, workflow_id, workflow_name, status, started_at, duration, triggered_by, snapshot, logs)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+            (user_id, workflow_id, workflow_name, result["status"],
+             result["started_at"], result["duration"], "manual",
+             json.dumps(snapshot), json.dumps(result["logs"]))
+        )
 
         await websocket.send_text(json.dumps({"type": "complete", "data": result}))
 

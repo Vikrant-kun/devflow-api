@@ -3,16 +3,17 @@ import re
 import base64 as b64
 from datetime import datetime, timezone
 from app.config import settings
-from app.database import supabase
+from app.database import query_one
 
 
 # ── Fetch user integrations ───────────────────────────────────────
 async def get_user_integrations(user_id: str) -> dict:
-    result = supabase.table("user_settings").select(
-        "github_token, selected_repo_full_name, slack_webhook_url, notion_token, linear_token, jira_token, jira_domain"
-    ).eq("user_id", user_id).execute()
-    print(f"DEBUG get_user_integrations: user_id={user_id}, rows={len(result.data)}, data={result.data}")
-    return result.data[0] if result.data else {}
+    row = query_one(
+        "SELECT github_token, selected_repo_full_name, slack_webhook_url, notion_token, linear_token, jira_token, jira_domain FROM user_settings WHERE user_id = %s",
+        (user_id,)
+    )
+    print(f"DEBUG get_user_integrations: user_id={user_id}, data={row}")
+    return row or {}
 
 
 # ── Email executor ────────────────────────────────────────────────

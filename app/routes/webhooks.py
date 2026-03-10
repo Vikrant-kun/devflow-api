@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Request, HTTPException, Header
-from app.database import supabase
+from app.database import query, query_one
 from app.services.executor import execute_workflow
 import hmac, hashlib, json
 
@@ -12,8 +12,11 @@ async def github_webhook(
     x_hub_signature_256: str = Header(None)
 ):
     body = await request.body()
-    result = supabase.table("user_settings").select("github_webhook_secret").eq("user_id", user_id).execute()
-    secret = result.data[0].get("github_webhook_secret") if result.data else None
+    row = query_one(
+        "SELECT github_webhook_secret FROM user_settings WHERE user_id = %s",
+        (user_id,)
+    )
+    secret = row.get("github_webhook_secret") if row else None
 
     if secret and x_hub_signature_256:
         expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
@@ -22,11 +25,10 @@ async def github_webhook(
 
     payload = json.loads(body)
     event_type = request.headers.get("X-GitHub-Event", "push")
-
-    workflows = supabase.table("workflows").select("*").eq("user_id", user_id).execute()
+    workflows = query("SELECT * FROM workflows WHERE user_id = %s", (user_id,))
     triggered = []
 
-    for workflow in (workflows.data or []):
+    for workflow in workflows:
         nodes = workflow.get("nodes", [])
         edges = workflow.get("edges", [])
         for node in nodes:
@@ -45,17 +47,13 @@ async def github_webhook(
                     nodes=nodes, edges=edges, user_id=user_id,
                     context={"event_type": event_type, "payload": str(payload)[:500], "triggered_by": "github_webhook"}
                 )
-                supabase.table("workflow_runs").insert({
-                    "user_id": user_id,
-                    "workflow_id": workflow["id"],
-                    "workflow_name": workflow["name"],
-                    "status": result["status"],
-                    "started_at": result["started_at"],
-                    "duration": result["duration"],
-                    "triggered_by": f"github_{event_type}",
-                    "snapshot": {"nodes": nodes, "edges": edges},
-                    "logs": result["logs"]
-                }).execute()
+                query(
+                    """INSERT INTO workflow_runs (user_id, workflow_id, workflow_name, status, started_at, duration, triggered_by, snapshot, logs)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (user_id, workflow["id"], workflow["name"], result["status"],
+                     result["started_at"], result["duration"], f"github_{event_type}",
+                     json.dumps({"nodes": nodes, "edges": edges}), json.dumps(result["logs"]))
+                )
                 triggered.append(workflow["name"])
                 break
 

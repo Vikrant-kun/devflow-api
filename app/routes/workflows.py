@@ -2,169 +2,97 @@ import json
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from app.auth import get_current_user
-from app.database import supabase
-from app.models.workflow import (
-    SaveWorkflowRequest, RunWorkflowRequest, GenerateWorkflowRequest
-)
+from app.database import query, query_one
+from app.models.workflow import SaveWorkflowRequest, RunWorkflowRequest, GenerateWorkflowRequest
 from app.services.executor import execute_workflow
 from app.config import settings
 
 router = APIRouter(prefix="/workflows", tags=["workflows"])
 
-
 @router.get("/")
 async def list_workflows(user: dict = Depends(get_current_user)):
-    result = (
-        supabase.table("workflows")
-        .select("*")
-        .eq("user_id", user["user_id"])
-        .order("created_at", desc=True)
-        .execute()
+    rows = query(
+        "SELECT * FROM workflows WHERE user_id = %s ORDER BY created_at DESC",
+        (user["user_id"],)
     )
-    return {"workflows": result.data}
-
+    return {"workflows": rows}
 
 @router.get("/{workflow_id}")
 async def get_workflow(workflow_id: str, user: dict = Depends(get_current_user)):
-    result = (
-        supabase.table("workflows")
-        .select("*")
-        .eq("id", workflow_id)
-        .eq("user_id", user["user_id"])
-        .execute()
+    row = query_one(
+        "SELECT * FROM workflows WHERE id = %s AND user_id = %s",
+        (workflow_id, user["user_id"])
     )
-    if not result.data:
+    if not row:
         raise HTTPException(status_code=404, detail="Workflow not found")
-    return result.data[0]
-
+    return row
 
 @router.post("/")
-async def save_workflow(
-    body: SaveWorkflowRequest,
-    user: dict = Depends(get_current_user)
-):
-    result = (
-        supabase.table("workflows")
-        .insert({
-            "user_id": user["user_id"],
-            "name": body.name,
-            "nodes": body.nodes,
-            "edges": body.edges,
-            "status": body.status or "draft"
-        })
-        .execute()
+async def save_workflow(body: SaveWorkflowRequest, user: dict = Depends(get_current_user)):
+    row = query_one(
+        """INSERT INTO workflows (user_id, name, nodes, edges, status)
+           VALUES (%s, %s, %s, %s, %s) RETURNING *""",
+        (user["user_id"], body.name, json.dumps(body.nodes), json.dumps(body.edges), body.status or "draft")
     )
-    if not result.data:
+    if not row:
         raise HTTPException(status_code=500, detail="Failed to save workflow")
-    return result.data[0]
-
+    return row
 
 @router.put("/{workflow_id}")
-async def update_workflow(
-    workflow_id: str,
-    body: SaveWorkflowRequest,
-    user: dict = Depends(get_current_user)
-):
-    result = (
-        supabase.table("workflows")
-        .update({
-            "name": body.name,
-            "nodes": body.nodes,
-            "edges": body.edges,
-            "status": body.status,
-        })
-        .eq("id", workflow_id)
-        .eq("user_id", user["user_id"])
-        .execute()
+async def update_workflow(workflow_id: str, body: SaveWorkflowRequest, user: dict = Depends(get_current_user)):
+    row = query_one(
+        """UPDATE workflows SET name=%s, nodes=%s, edges=%s, status=%s, updated_at=NOW()
+           WHERE id=%s AND user_id=%s RETURNING *""",
+        (body.name, json.dumps(body.nodes), json.dumps(body.edges), body.status, workflow_id, user["user_id"])
     )
-    if not result.data:
+    if not row:
         raise HTTPException(status_code=404, detail="Workflow not found")
-    return result.data[0]
-
+    return row
 
 @router.delete("/{workflow_id}")
-async def delete_workflow(
-    workflow_id: str,
-    user: dict = Depends(get_current_user)
-):
-    supabase.table("workflows").delete().eq("id", workflow_id).eq("user_id", user["user_id"]).execute()
+async def delete_workflow(workflow_id: str, user: dict = Depends(get_current_user)):
+    query("DELETE FROM workflows WHERE id=%s AND user_id=%s", (workflow_id, user["user_id"]))
     return {"deleted": True}
 
-
 @router.post("/run")
-async def run_workflow(
-    body: RunWorkflowRequest,
-    user: dict = Depends(get_current_user)
-):
-    # Safely extract prompt from snapshot model
+async def run_workflow(body: RunWorkflowRequest, user: dict = Depends(get_current_user)):
     prompt_val = getattr(body.snapshot, "prompt", "")
-
     result = await execute_workflow(
         nodes=body.snapshot.nodes,
         edges=body.snapshot.edges,
         user_id=user["user_id"],
         context={"prompt": prompt_val}
     )
-
-    run_data = {
-        "user_id": user["user_id"],
-        "workflow_id": body.workflow_id,
-        "workflow_name": body.workflow_name,
-        "status": result["status"],
-        "started_at": result["started_at"],
-        "duration": result["duration"],
-        "triggered_by": "manual",
-        "snapshot": body.snapshot.model_dump(),
-        "logs": result["logs"]
-    }
-
-    run_result = supabase.table("workflow_runs").insert(run_data).execute()
-
+    run_row = query_one(
+        """INSERT INTO workflow_runs (user_id, workflow_id, workflow_name, status, started_at, duration, triggered_by, snapshot, logs)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *""",
+        (user["user_id"], body.workflow_id, body.workflow_name, result["status"],
+         result["started_at"], result["duration"], "manual",
+         json.dumps(body.snapshot.model_dump()), json.dumps(result["logs"]))
+    )
     return {
-        "run_id": run_result.data[0]["id"] if run_result.data else None,
+        "run_id": run_row["id"] if run_row else None,
         "status": result["status"],
         "duration": result["duration"],
         "logs": result["logs"]
     }
-
 
 @router.post("/generate")
-async def generate_workflow(
-    body: GenerateWorkflowRequest,
-    user: dict = Depends(get_current_user)
-):
+async def generate_workflow(body: GenerateWorkflowRequest, user: dict = Depends(get_current_user)):
     system_prompt = """You are a workflow automation expert. Convert the user's description into a structured pipeline. Return ONLY valid JSON, no markdown:
 {"name":"Short workflow name","nodes":[{"id":"1","type":"trigger|action|ai|notification","label":"Short Name","description":"What this step does","icon":"git-branch|zap|sparkles|bell|code|database|mail"}],"edges":[{"source":"1","target":"2"}]}
 Rules: first node always trigger, max 8 nodes, labels 2-4 words."""
-
     async with httpx.AsyncClient() as client:
         res = await client.post(
             "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {settings.GROQ_API_KEY}"
-            },
-            json={
-                "model": "llama-3.3-70b-versatile",
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": body.prompt}
-                ],
-                "max_tokens": 1024,
-                "temperature": 0.7
-            },
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {settings.GROQ_API_KEY}"},
+            json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": body.prompt}], "max_tokens": 1024, "temperature": 0.7},
             timeout=20.0
         )
-
     if res.status_code != 200:
         raise HTTPException(status_code=502, detail=f"Groq error: {res.status_code}")
-
-    data = res.json()
-    raw = data["choices"][0]["message"]["content"].replace("```json", "").replace("```", "").strip()
-
+    raw = res.json()["choices"][0]["message"]["content"].replace("```json", "").replace("```", "").strip()
     try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
+        return json.loads(raw)
+    except:
         raise HTTPException(status_code=422, detail="Failed to parse AI response")
-
-    return parsed
