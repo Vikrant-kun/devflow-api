@@ -283,20 +283,22 @@ async def _get_all_ancestor_outputs(node_id: str, edges: list, all_node_outputs:
 
 async def _classify_node_intent(label: str, description: str) -> str:
     """Use AI to classify what a node should do."""
-    prompt = f"""You are a workflow node classifier. Given a node label and description, return ONLY one of these exact strings:
-- email
-- ai_code_edit  
-- github
-- slack
-- notion
-- linear
-- jira
-- ai
+    prompt = f"""You are a workflow node classifier. Classify what this node should do.
 
 Node label: {label}
 Node description: {description}
 
-Return only the single classification word, nothing else."""
+Rules:
+- If it analyzes, scans, inspects, reviews, or fixes CODE → return: ai_code_edit
+- If it sends an email → return: email
+- If it creates issues, branches, PRs, or commits on GitHub → return: github
+- If it sends a Slack message → return: slack
+- If it creates a Notion page → return: notion
+- If it creates a Linear issue → return: linear
+- If it creates a Jira ticket → return: jira
+- If it's a general AI task → return: ai
+
+Return ONLY one word from the list above, nothing else."""
 
     async with httpx.AsyncClient() as client:
         res = await client.post(
