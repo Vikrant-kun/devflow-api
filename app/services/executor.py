@@ -225,26 +225,34 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
 
 # ── Helper: evaluate a conditional edge ──────────────────────────────
 def _edge_condition_passes(condition: str, parent_output: str) -> bool:
-    """Returns True if the edge condition matches the parent node's output."""
     if not condition or condition == "always":
         return True
 
-    out = parent_output.lower()
+    out = parent_output.lower().strip()
+
+    # Semantic success signals
+    success_signals = [
+        "no issues found", "no changes needed", "no errors", "no bugs",
+        "all clear", "clean", "passed", "nothing found", "no problems",
+        "no syntax error", "✅ no issues"
+    ]
+
+    # Semantic error signals  
+    error_signals = [
+        "✅ fixed and committed", "fixed and committed", "errors found",
+        "bugs found", "issues found", "syntax error", "failed", "exception"
+    ]
+
+    has_errors = any(s in out for s in error_signals)
+    is_clean = any(s in out for s in success_signals) and not has_errors
 
     if condition == "errors_found":
-        return (
-            "✅ fixed and committed" in out or
-            "fixed and committed" in out or
-            "##status:errors_found##" in out
-        )
+        return has_errors
 
     if condition == "no_errors":
-        return (
-            "✅ no issues found" in out or
-            "no changes needed" in out or
-            "##status:no_errors##" in out
-        )
+        return is_clean or not has_errors
 
+    # Semantic fallback for free-text conditions
     return True  # unknown condition → always pass
 
 
