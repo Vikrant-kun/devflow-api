@@ -40,7 +40,7 @@ async def _execute_email(node_data: dict, context: dict) -> str:
     # Parse body for sections
     lines = body.split('\n')
     commit_url = next((w for line in lines for w in line.split() if 'github.com' in w and 'commit' in w), None)
-    files_changed = [l.strip() for l in lines if any(l.strip().startswith(p) for p in ['- ', '✅', '📁', 'Modified', 'Changed', 'Fixed'])]
+    files_changed = [l.strip() for l in lines if any(l.strip().startswith(p) for p in ['- ', '📁', 'Modified:', 'Changed:', 'Fixed:'])]
     status_emoji = '✅' if any(w in body.lower() for w in ['fixed', 'success', 'no issues', 'clean']) else '⚠️'
 
     files_html = ''.join(f'<div style="padding:4px 0;border-bottom:1px solid #1A1A1A;color:#94A3B8;font-size:11px;">📁 {f}</div>' for f in files_changed[:10]) if files_changed else ''
