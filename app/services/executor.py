@@ -1,4 +1,5 @@
 import httpx
+import asyncio
 import re
 import base64 as b64
 from datetime import datetime, timezone
@@ -257,7 +258,7 @@ def _edge_condition_passes(condition: str, parent_output: str) -> bool:
 
 
 # ── Helper: Get all ancestor outputs ─────────────────────────────────────────
-def _get_all_ancestor_outputs(node_id: str, edges: list, all_node_outputs: dict) -> str:
+async def _get_all_ancestor_outputs(node_id: str, edges: list, all_node_outputs: dict) -> str:
     """Walk the full ancestor chain and return all outputs as one string."""
     if not node_id or not edges or not all_node_outputs:
         return " ".join(str(v) for v in all_node_outputs.values())
@@ -280,6 +281,40 @@ def _get_all_ancestor_outputs(node_id: str, edges: list, all_node_outputs: dict)
     return " ".join(all_outputs)
 
 
+async def _classify_node_intent(label: str, description: str) -> str:
+    """Use AI to classify what a node should do."""
+    prompt = f"""You are a workflow node classifier. Given a node label and description, return ONLY one of these exact strings:
+- email
+- ai_code_edit  
+- github
+- slack
+- notion
+- linear
+- jira
+- ai
+
+Node label: {label}
+Node description: {description}
+
+Return only the single classification word, nothing else."""
+
+    async with httpx.AsyncClient() as client:
+        res = await client.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 10,
+                "temperature": 0
+            },
+            timeout=10.0
+        )
+        if res.status_code == 200:
+            return res.json()["choices"][0]["message"]["content"].strip().lower()
+    return "ai"  # safe fallback
+
+
 # ── Main node dispatcher ─────────────────────────────────────────────
 async def _execute_node(node_type: str, node_data: dict, user_id: str, integrations: dict, context: dict) -> str:
     label = node_data.get("label", "step").lower()
@@ -293,10 +328,10 @@ async def _execute_node(node_type: str, node_data: dict, user_id: str, integrati
         return await _execute_ai(node_data, context, integrations)
 
     elif node_type in ("action", "notification"):
-        node_email = node_data.get("email", "")
+        intent = await _classify_node_intent(label, description)
 
-        # ── Email node ────────────────────────────────────────────────────
-        if "mail" in icon or "email" in label or "@" in label or "@" in description or "@" in node_email:
+        if intent == "email":
+            node_email = node_data.get("email", "")
             all_node_outputs = context.get("all_node_outputs", {})
             edges = context.get("edges", [])
             current_node_id = context.get("current_node_id", "")
@@ -366,31 +401,20 @@ async def _execute_node(node_type: str, node_data: dict, user_id: str, integrati
                 print(f"DEBUG: Ambiguous email intent for '{label}' — sending anyway")
                 return await _execute_email(node_data, context)
 
-        # ── Code edit / fix / refactor ────────────────────────────────────
-        elif any(k in label for k in ["fix", "edit", "refactor", "improve", "debug", "error", "finder", "check", "scan", "review", "clean", "lint", "bug"]) or \
-             (any(k in label for k in ["push", "commit"]) and any(k in label for k in ["main", "branch", "code"])):
+        elif intent == "ai_code_edit":
             return await _execute_ai_code_edit(node_data, integrations, context)
-
-        # ── Generic GitHub ────────────────────────────────────────────────
-        elif any(k in label for k in ["github", "commit", "push", "pr", "pull request", "branch", "repo"]) or icon in ["git-branch", "github"]:
+        elif intent == "github":
             return await _execute_github(node_data, integrations, context)
-
-        # ── Slack ─────────────────────────────────────────────────────────
-        elif any(k in label for k in ["slack", "notify", "notification", "message", "alert"]) or icon in ["bell", "slack"]:
+        elif intent == "slack":
             return await _execute_slack(node_data, integrations, context)
-
-        # ── Notion / Linear / Jira ────────────────────────────────────────
-        elif any(k in label for k in ["notion"]):
+        elif intent == "notion":
             return await _execute_notion(node_data, integrations, context)
-
-        elif any(k in label for k in ["linear", "issue", "ticket"]):
+        elif intent == "linear":
             return await _execute_linear(node_data, integrations, context)
-
-        elif any(k in label for k in ["jira", "ticket", "atlassian"]):
+        elif intent == "jira":
             return await _execute_jira(node_data, integrations, context)
-
         else:
-            return f"Action '{node_data.get('label')}' executed"
+            return await _execute_ai(node_data, context, integrations)
 
     return f"Step '{node_data.get('label')}' completed"
 
