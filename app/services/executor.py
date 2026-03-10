@@ -238,7 +238,12 @@ Parent node output:
 Edge condition to evaluate:
 "{condition}"
 
-Does the parent output satisfy this condition? 
+Important context:
+- "✅ Fixed and committed" means errors WERE found and fixed → errors exist
+- "✅ No issues found" means code was clean → no errors
+- "no changes needed" means code was clean → no errors
+
+Does the parent output satisfy this condition?
 Reply with ONLY: true or false"""
 
     async with httpx.AsyncClient() as client:
