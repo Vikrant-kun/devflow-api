@@ -80,7 +80,9 @@ async def _execute_email(node_data: dict, context: dict) -> str:
             smtp.login(settings.GMAIL_USER, settings.GMAIL_APP_PASSWORD)
             smtp.sendmail(settings.GMAIL_USER, to_email, msg.as_string())
 
-    await asyncio.get_event_loop().run_in_executor(None, send)
+    import asyncio
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, send)
     return f"✅ Email sent to {to_email}"
 
 
