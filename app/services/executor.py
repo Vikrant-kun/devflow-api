@@ -502,8 +502,13 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
     file_map = {f["path"]: "" for f in tree if f["type"] == "blob"}
     repo_index = _get_repo_index(repo, file_map)
     ranked_files = _rank_files_by_query(description, repo_index)
+    
+    selected_files = context.get("selected_files", [])
     failed_files = _reflection_penalty(repo, description)
-    ranked_files = [f for f in ranked_files if f not in failed_files]
+    
+    # Prioritize pinned files, then ranked files, excluding failures
+    pinned_files = [f for f in selected_files if f in code_files and f not in failed_files]
+    ranked_files = pinned_files + [f for f in ranked_files if f not in pinned_files and f not in failed_files]
 
     filtered_files = match_files(code_files, filters)
 
@@ -512,8 +517,23 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
 
     print(f"DEBUG INDEX RANKED FILES: {ranked_files[:5]}")
     print(f"DEBUG REFLECTION AVOID FILES: {failed_files}")
+    print(f"DEBUG SELECTED FILES: {selected_files}")
 
-    plan = await _plan_code_task(description, repo, filtered_files)
+    user_selected = context.get("selected_files", [])
+    if user_selected:
+        valid_selected = [f for f in user_selected if f in code_files]
+        if valid_selected:
+            print(f"DEBUG: User pre-selected files: {valid_selected} — skipping planner")
+            plan = {
+                "target_files": valid_selected,
+                "actions": [],
+                "summary": "user-selected files"
+            }
+        else:
+            plan = await _plan_code_task(description, repo, filtered_files)
+    else:
+        plan = await _plan_code_task(description, repo, filtered_files)
+
     print(f"DEBUG PLANNER: selected={plan['target_files']} | plan={plan.get('summary')}")
 
     results = []
