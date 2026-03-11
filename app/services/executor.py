@@ -413,6 +413,7 @@ Rules:
 - If it creates a Linear issue → return: linear
 - If it creates a Jira ticket → return: jira
 - If it's a general AI task → return: ai
+- If it creates, reviews, or merges a Pull Request → return: pr
 
 Return ONLY one word from the list above, nothing else."""
 
@@ -486,8 +487,11 @@ async def _execute_node(node_type: str, node_data: dict, user_id: str, integrati
             return await _execute_linear(node_data, integrations, context)
         elif intent == "jira":
             return await _execute_jira(node_data, integrations, context)
+        elif intent == "pr":
+            return await _execute_pr(node_data, integrations, context)
         else:
             return await _execute_ai(node_data, context, integrations)
+        
 
     return f"Step '{node_data.get('label')}' completed"
 
@@ -944,3 +948,168 @@ async def execute_workflow_ws(
         "started_at": start.isoformat(),
         "finished_at": end.isoformat()
     }
+
+async def _execute_pr(node_data: dict, integrations: dict, context: dict) -> str:
+    token = integrations.get("github_token")
+    repo = integrations.get("selected_repo_full_name")
+    
+    if not token or not repo:
+        raise Exception("GitHub not connected or no repo selected.")
+    
+    label = node_data.get("label", "").lower()
+    description = node_data.get("description", "").lower()
+    combined = label + " " + description
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    client = get_http_client()
+    parent_output = "\n".join(context.get("parent_outputs", []))
+
+    # Get default branch
+    branch_cache_key = f"branch:{repo}"
+    default_branch = cache_get(branch_cache_key)
+    if not default_branch:
+        r = await client.get(f"https://api.github.com/repos/{repo}", headers=headers)
+        default_branch = r.json().get("default_branch", "main") if r.status_code == 200 else "main"
+        cache_set(branch_cache_key, default_branch)
+
+    # ── MERGE PR ─────────────────────────────────────────────────
+    if any(k in combined for k in ["merge", "auto merge", "automerge"]):
+        # Get open PRs
+        prs_res = await client.get(
+            f"https://api.github.com/repos/{repo}/pulls?state=open",
+            headers=headers
+        )
+        if prs_res.status_code != 200 or not prs_res.json():
+            return "No open PRs found to merge"
+        
+        pr = prs_res.json()[0]  # merge most recent
+        pr_number = pr["number"]
+        
+        merge_res = await client.put(
+            f"https://api.github.com/repos/{repo}/pulls/{pr_number}/merge",
+            headers=headers,
+            json={
+                "commit_title": f"DevFlow AI: Auto-merged PR #{pr_number}",
+                "merge_method": "squash"
+            }
+        )
+        if merge_res.status_code == 200:
+            return f"✅ Merged PR #{pr_number}: {pr['title']}"
+        raise Exception(f"Merge failed: {merge_res.json().get('message')}")
+
+    # ── REVIEW PR ────────────────────────────────────────────────
+    elif any(k in combined for k in ["review", "check pr", "inspect pr"]):
+        prs_res = await client.get(
+            f"https://api.github.com/repos/{repo}/pulls?state=open",
+            headers=headers
+        )
+        if prs_res.status_code != 200 or not prs_res.json():
+            return "No open PRs found to review"
+        
+        pr = prs_res.json()[0]
+        pr_number = pr["number"]
+        
+        # Get PR diff
+        diff_res = await client.get(
+            f"https://api.github.com/repos/{repo}/pulls/{pr_number}/files",
+            headers=headers
+        )
+        files_changed = diff_res.json() if diff_res.status_code == 200 else []
+        diff_summary = "\n".join([
+            f"File: {f['filename']} (+{f['additions']} -{f['deletions']})\n{f.get('patch', '')[:500]}"
+            for f in files_changed[:5]
+        ])
+
+        # AI review
+        review_prompt = f"""You are an expert code reviewer.
+PR Title: {pr['title']}
+PR Description: {pr.get('body', 'No description')}
+
+Files changed:
+{diff_summary}
+
+Provide a concise code review (3-5 bullet points). 
+End with either APPROVE or REQUEST_CHANGES."""
+
+        res = await _groq_request({
+            "model": "llama-3.3-70b-versatile",
+            "messages": [{"role": "user", "content": review_prompt}],
+            "max_tokens": 500,
+            "temperature": 0.3
+        })
+
+        review_body = res.json()["choices"][0]["message"]["content"].strip()
+        approved = "APPROVE" in review_body
+
+        # Post review to GitHub
+        await client.post(
+            f"https://api.github.com/repos/{repo}/pulls/{pr_number}/reviews",
+            headers=headers,
+            json={
+                "body": f"**DevFlow AI Review:**\n\n{review_body}",
+                "event": "APPROVE" if approved else "REQUEST_CHANGES"
+            }
+        )
+
+        return f"{'✅ Approved' if approved else '⚠️ Changes requested'} PR #{pr_number}: {pr['title']}\n\n{review_body}"
+
+    # ── CREATE PR (default) ───────────────────────────────────────
+    else:
+        # Create new branch
+        pr_branch = f"devflow/fix-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+        
+        # Get HEAD sha
+        ref_res = await client.get(
+            f"https://api.github.com/repos/{repo}/git/ref/heads/{default_branch}",
+            headers=headers
+        )
+        if ref_res.status_code != 200:
+            raise Exception("Could not get branch reference")
+        
+        head_sha = ref_res.json()["object"]["sha"]
+        
+        # Create branch
+        await client.post(
+            f"https://api.github.com/repos/{repo}/git/refs",
+            headers=headers,
+            json={"ref": f"refs/heads/{pr_branch}", "sha": head_sha}
+        )
+
+        # AI generates PR title and description
+        pr_prompt = f"""Generate a pull request title and description based on this context:
+{parent_output or description or 'Code improvements by DevFlow AI'}
+
+Respond in this exact format:
+TITLE: <one line title>
+DESCRIPTION: <2-3 sentence description of changes>"""
+
+        pr_res = await _groq_request({
+            "model": "llama-3.3-70b-versatile",
+            "messages": [{"role": "user", "content": pr_prompt}],
+            "max_tokens": 200,
+            "temperature": 0.4
+        })
+
+        pr_content = pr_res.json()["choices"][0]["message"]["content"].strip()
+        title_match = re.search(r'TITLE:\s*(.+)', pr_content)
+        desc_match = re.search(r'DESCRIPTION:\s*(.+)', pr_content, re.DOTALL)
+
+        pr_title = title_match.group(1).strip() if title_match else f"DevFlow AI: {node_data.get('label', 'improvements')}"
+        pr_body = desc_match.group(1).strip() if desc_match else parent_output or "Automated improvements by DevFlow AI"
+
+        # Create PR
+        create_res = await client.post(
+            f"https://api.github.com/repos/{repo}/pulls",
+            headers=headers,
+            json={
+                "title": pr_title,
+                "body": f"{pr_body}\n\n---\n*Created automatically by DevFlow AI*",
+                "head": pr_branch,
+                "base": default_branch
+            }
+        )
+
+        if create_res.status_code == 201:
+            pr = create_res.json()
+            return f"✅ PR #{pr['number']} created: {pr['html_url']}\n\nTitle: {pr_title}\n{pr_body}"
+        
+        raise Exception(f"PR creation failed: {create_res.json().get('message')}")

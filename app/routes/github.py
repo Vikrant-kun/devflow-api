@@ -422,3 +422,88 @@ async def get_repo_tree(user=Depends(get_current_user)):
     ]
     
     return {"repo": repo, "files": files}
+
+@router.post("/disconnect/")
+async def disconnect_github(user=Depends(get_current_user)):
+    query(
+        "UPDATE user_settings SET github_token = NULL WHERE user_id = %s",
+        (user["user_id"],)
+    )
+    # Clear cache
+    cache_key = f"repo:{user['user_id']}"
+    if cache_key in _cache:
+        del _cache[cache_key]
+    return {"success": True}
+
+@router.get("/pulls/")
+async def get_pull_requests(user=Depends(get_current_user)):
+    settings_row = query_one(
+        "SELECT github_token, selected_repo_full_name FROM user_settings WHERE user_id = %s",
+        (user["user_id"],)
+    )
+    if not settings_row:
+        raise HTTPException(status_code=400, detail="GitHub not connected")
+    
+    token = settings_row.get("github_token")
+    repo = settings_row.get("selected_repo_full_name")
+    
+    client = get_http_client()
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    
+    res = await client.get(
+        f"https://api.github.com/repos/{repo}/pulls?state=open",
+        headers=headers
+    )
+    if res.status_code != 200:
+        raise HTTPException(status_code=res.status_code, detail="Failed to fetch PRs")
+    
+    return {"pulls": res.json()}
+
+@router.post("/pulls/create/")
+async def create_pull_request(body: dict, user=Depends(get_current_user)):
+    settings_row = query_one(
+        "SELECT github_token, selected_repo_full_name FROM user_settings WHERE user_id = %s",
+        (user["user_id"],)
+    )
+    token = settings_row.get("github_token")
+    repo = settings_row.get("selected_repo_full_name")
+    
+    client = get_http_client()
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    
+    res = await client.post(
+        f"https://api.github.com/repos/{repo}/pulls",
+        headers=headers,
+        json={
+            "title": body.get("title"),
+            "body": body.get("body", ""),
+            "head": body.get("head"),
+            "base": body.get("base", "main")
+        }
+    )
+    if res.status_code != 201:
+        raise HTTPException(status_code=res.status_code, detail=res.json().get("message"))
+    
+    return res.json()
+
+@router.put("/pulls/{pr_number}/merge/")
+async def merge_pull_request(pr_number: int, user=Depends(get_current_user)):
+    settings_row = query_one(
+        "SELECT github_token, selected_repo_full_name FROM user_settings WHERE user_id = %s",
+        (user["user_id"],)
+    )
+    token = settings_row.get("github_token")
+    repo = settings_row.get("selected_repo_full_name")
+    
+    client = get_http_client()
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    
+    res = await client.put(
+        f"https://api.github.com/repos/{repo}/pulls/{pr_number}/merge",
+        headers=headers,
+        json={"merge_method": "squash"}
+    )
+    if res.status_code != 200:
+        raise HTTPException(status_code=res.status_code, detail=res.json().get("message"))
+    
+    return res.json()
