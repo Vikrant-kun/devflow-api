@@ -140,21 +140,25 @@ async def _execute_email(node_data: dict, context: dict) -> str:
 # Extract file filters from description
 def extract_file_filters(text: str) -> list:
     filters = []
-    # comma separated paths/globs
-    parts = [p.strip() for p in re.split(r'[,;]', text)]
-    for part in parts:
-        # exact file path
-        if re.match(r'[a-zA-Z0-9_/.-]+\.[a-zA-Z0-9]+', part):
-            match = re.search(r'[a-zA-Z0-9_/.-]+\.[a-zA-Z0-9]+', part)
-            if match:
-                filters.append(match.group(0))
-        # glob pattern like *.js
-        elif '*' in part or '?' in part:
-            filters.append(part)
-        # folder like src/
-        elif part.endswith('/'):
-            filters.append(part)
-    return filters
+    text_lower = text.lower()
+    
+    # Check for folder hints like "copy/js/" or "copy/js" or "all js files"
+    folder_match = re.findall(r'[a-zA-Z0-9_][a-zA-Z0-9_/.-]*/(?:[a-zA-Z0-9_.-]+/)*', text)
+    for f in folder_match:
+        filters.append(f)
+    
+    # Glob patterns like *.js
+    glob_match = re.findall(r'\*\.[a-zA-Z0-9]+', text)
+    filters.extend(glob_match)
+    
+    # Exact file paths like src/main.py
+    file_match = re.findall(r'[a-zA-Z0-9_][a-zA-Z0-9_/.-]*\.[a-zA-Z0-9]{1,6}', text)
+    for f in file_match:
+        # skip if looks like a domain or version number
+        if '/' in f or len(f.split('.')[-1]) <= 4:
+            filters.append(f)
+    
+    return list(set(filters))
 
 def match_files(code_files: list, filters: list) -> list:
     if not filters:
@@ -162,18 +166,23 @@ def match_files(code_files: list, filters: list) -> list:
     matched = []
     for f in code_files:
         for pattern in filters:
-            if pattern.endswith('/'):
-                if f.startswith(pattern):
+            # folder prefix match — "copy/js" matches "copy/js/script.js"
+            if f.startswith(pattern.rstrip('/') + '/') or f.startswith(pattern):
+                if f not in matched:
                     matched.append(f)
+                break
+            # glob match
+            elif '*' in pattern or '?' in pattern:
+                if fnmatch.fnmatch(f, pattern) or fnmatch.fnmatch(f.split('/')[-1], pattern):
+                    if f not in matched:
+                        matched.append(f)
                     break
-            elif fnmatch.fnmatch(f, pattern) or fnmatch.fnmatch(f.split('/')[-1], pattern):
-                matched.append(f)
-                break
+            # exact match
             elif f == pattern or f.endswith('/' + pattern):
-                matched.append(f)
+                if f not in matched:
+                    matched.append(f)
                 break
-    return matched or code_files  # fallback to all if nothing matched
-
+    return matched or code_files
 
 # ── AI Code Edit executor ────────────────────────────────────────────────────
 async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: dict) -> str:
@@ -218,10 +227,11 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
         file_list_str = "\n".join(filtered_files[:60])
         pick_prompt = (
             f"Repository: {repo}\n\n"
-            f"Task description: {description or 'find and fix bugs / improve code'}\n\n"
-            f"From this list of files, select the SINGLE most relevant file to work on for this task.\n"
-            f"Return ONLY the full file path, nothing else.\n"
-            f"Files:\n{file_list_str}"
+            f"Task: {description or 'find and fix bugs'}\n\n"
+            f"IMPORTANT: You MUST select a file from THIS EXACT LIST ONLY. "
+            f"Do NOT invent or guess filenames. Do NOT use files from other repos. "
+            f"Return ONLY the exact file path as it appears below, nothing else.\n\n"
+            f"Available files:\n{file_list_str}"
         )
         pick_res = await _groq_request({
             "model": "llama-3.3-70b-versatile",
@@ -398,24 +408,27 @@ def _get_all_ancestor_outputs(node_id: str, edges: list, all_node_outputs: dict)
 
 
 async def _classify_node_intent(label: str, description: str) -> str:
-    """Use AI to classify what a node should do."""
     prompt = f"""You are a workflow node classifier. Classify what this node should do.
-
 Node label: {label}
 Node description: {description}
 
-Rules:
-- If it analyzes, scans, inspects, reviews, or fixes CODE → return: ai_code_edit
-- If it sends an email → return: email
-- If it creates issues, branches, PRs, or commits on GitHub → return: github
-- If it sends a Slack message → return: slack
-- If it creates a Notion page → return: notion
-- If it creates a Linear issue → return: linear
-- If it creates a Jira ticket → return: jira
-- If it's a general AI task → return: ai
-- If it creates, reviews, or merges a Pull Request → return: pr
+Rules (in strict priority order):
+- If it sends an EMAIL, has words like "alert", "notify via email", "send email", "all clear email", "error alert" → return: email
+- If it analyzes, scans, inspects, reviews, fixes, or edits CODE or FILES → return: ai_code_edit  
+- If it creates/reviews/merges a Pull Request or PR → return: pr
+- If it creates issues, branches, or commits on GitHub (NOT email, NOT PR) → return: github
+- If it explicitly mentions Slack or sends a Slack message → return: slack
+- If it explicitly mentions Notion → return: notion
+- If it explicitly mentions Linear → return: linear
+- If it explicitly mentions Jira → return: jira
+- If it is a general AI task → return: ai
 
-Return ONLY one word from the list above, nothing else."""
+IMPORTANT:
+- "notify", "alert", "notification" WITHOUT mentioning Slack/Notion/Jira = email
+- NEVER return slack unless the word "slack" is explicitly in the label or description
+- NEVER return github for PR actions — use pr instead
+
+Return ONLY one word. No explanation."""
 
     res = await _groq_request({
         "model": "llama-3.3-70b-versatile",
