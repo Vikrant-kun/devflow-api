@@ -1,6 +1,7 @@
 import httpx
 import asyncio
 import re
+import fnmatch
 import base64 as b64
 from datetime import datetime, timezone
 from app.config import settings
@@ -89,6 +90,44 @@ async def _execute_email(node_data: dict, context: dict) -> str:
         raise Exception(f"Email failed: {res.status_code} {res.text}")
 
 
+# Extract file filters from description
+def extract_file_filters(text: str) -> list:
+    filters = []
+    # comma separated paths/globs
+    parts = [p.strip() for p in re.split(r'[,;]', text)]
+    for part in parts:
+        # exact file path
+        if re.match(r'[a-zA-Z0-9_/.-]+\.[a-zA-Z0-9]+', part):
+            match = re.search(r'[a-zA-Z0-9_/.-]+\.[a-zA-Z0-9]+', part)
+            if match:
+                filters.append(match.group(0))
+        # glob pattern like *.js
+        elif '*' in part or '?' in part:
+            filters.append(part)
+        # folder like src/
+        elif part.endswith('/'):
+            filters.append(part)
+    return filters
+
+def match_files(code_files: list, filters: list) -> list:
+    if not filters:
+        return code_files
+    matched = []
+    for f in code_files:
+        for pattern in filters:
+            if pattern.endswith('/'):
+                if f.startswith(pattern):
+                    matched.append(f)
+                    break
+            elif fnmatch.fnmatch(f, pattern) or fnmatch.fnmatch(f.split('/')[-1], pattern):
+                matched.append(f)
+                break
+            elif f == pattern or f.endswith('/' + pattern):
+                matched.append(f)
+                break
+    return matched or code_files  # fallback to all if nothing matched
+
+
 # ── AI Code Edit executor ────────────────────────────────────────────────────
 async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: dict) -> str:
     token = integrations.get("github_token")
@@ -99,11 +138,7 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
     description = (node_data.get("description") or node_data.get("label") or "").strip()
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
 
-    file_match = re.search(r'(?:file|path|fix|edit|in|at)\s*:\s*([a-zA-Z0-9_/.-]+\.[a-zA-Z0-9]+)', description, re.IGNORECASE)
-    if not file_match:
-        file_match = re.search(r'[a-zA-Z0-9_/.-]+\.(?:py|js|jsx|ts|tsx|css|html|json|md|yaml|yml|java|go|rs|cpp|c|h)', description)
-
-    filepath = file_match.group(0).strip() if file_match else None
+    filters = extract_file_filters(description)
 
     async with httpx.AsyncClient(timeout=45.0) as client:
         tree_res = await client.get(
@@ -124,18 +159,19 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
         if not code_files:
             raise Exception("No relevant code files found in the repository.")
 
-        if filepath and filepath in code_files:
-            selected_path = filepath
+        filtered_files = match_files(code_files, filters)
+
+        if len(filtered_files) == 1:
+            selected_path = filtered_files[0]
         else:
-            file_list_str = "\n".join(code_files[:60])
+            file_list_str = "\n".join(filtered_files[:60])
             pick_prompt = (
                 f"Repository: {repo}\n\n"
                 f"Task description: {description or 'find and fix bugs / improve code'}\n\n"
                 f"From this list of files, select the SINGLE most relevant file to work on for this task.\n"
-                f"Return ONLY the full file path, nothing else.\n\n"
+                f"Return ONLY the full file path, nothing else.\n"
                 f"Files:\n{file_list_str}"
             )
-
             pick_res = await client.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}", "Content-Type": "application/json"},
@@ -147,12 +183,11 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
                 },
                 timeout=15.0
             )
-
             if pick_res.status_code == 200:
                 ai_choice = pick_res.json()["choices"][0]["message"]["content"].strip().strip('"').strip("'")
-                selected_path = ai_choice if ai_choice in code_files else code_files[0]
+                selected_path = ai_choice if ai_choice in filtered_files else filtered_files[0]
             else:
-                selected_path = code_files[0]
+                selected_path = filtered_files[0]
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         content_res = await client.get(
@@ -226,7 +261,36 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
             err_body = commit_res.json()
             raise Exception(f"Commit failed ({commit_res.status_code}): {err_body.get('message')} | repo={repo} | file={selected_path}")
 
-        return f"✅ Fixed and committed {selected_path} to {repo}/{default_branch}"
+        # Auto PR if description mentions "pr" or "pull request"
+        pr_url = ""
+        if any(k in description.lower() for k in ["pr", "pull request", "open pr", "create pr"]):
+            pr_branch = f"devflow/fix-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+            # create branch
+            ref_res = await client.get(
+                f"https://api.github.com/repos/{repo}/git/ref/heads/{default_branch}",
+                headers=headers
+            )
+            if ref_res.status_code == 200:
+                sha_branch = ref_res.json()["object"]["sha"]
+                await client.post(
+                    f"https://api.github.com/repos/{repo}/git/refs",
+                    headers=headers,
+                    json={"ref": f"refs/heads/{pr_branch}", "sha": sha_branch}
+                )
+                pr_res = await client.post(
+                    f"https://api.github.com/repos/{repo}/pulls",
+                    headers=headers,
+                    json={
+                        "title": f"DevFlow AI: fixes in {selected_path}",
+                        "body": f"Auto-generated PR by DevFlow AI\n\nFixed: `{selected_path}`",
+                        "head": pr_branch,
+                        "base": default_branch
+                    }
+                )
+                if pr_res.status_code == 201:
+                    pr_url = f"\n🔀 PR created: {pr_res.json()['html_url']}"
+
+        return f"✅ Fixed and committed {selected_path} to {repo}/{default_branch}{pr_url}"
 
 
 # ── Helper: evaluate a conditional edge ──────────────────────────────
