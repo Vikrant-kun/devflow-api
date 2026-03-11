@@ -383,7 +383,7 @@ async def get_branches(user: dict = Depends(get_current_user)):
 
     return {"branches": branches}
 
-@router.get("/repo-tree")
+@router.get("/repo-tree/")
 async def get_repo_tree(user=Depends(get_current_user)):
     settings_row = query_one(
         "SELECT github_token, selected_repo_full_name FROM user_settings WHERE user_id = %s",
