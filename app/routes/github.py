@@ -382,3 +382,43 @@ async def get_branches(user: dict = Depends(get_current_user)):
 ]
 
     return {"branches": branches}
+
+@router.get("/repo-tree")
+async def get_repo_tree(user=Depends(get_current_user)):
+    settings_row = query_one(
+        "SELECT github_token, selected_repo_full_name FROM user_settings WHERE user_id = %s",
+        (user["user_id"],)
+    )
+    if not settings_row:
+        raise HTTPException(status_code=400, detail="GitHub not connected")
+    
+    token = settings_row.get("github_token")
+    repo = settings_row.get("selected_repo_full_name")
+    
+    if not token or not repo:
+        raise HTTPException(status_code=400, detail="GitHub not connected or no repo selected")
+    
+    client = get_github_client()
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    
+    res = await client.get(
+        f"https://api.github.com/repos/{repo}/git/trees/HEAD?recursive=1",
+        headers=headers
+    )
+    
+    if res.status_code != 200:
+        raise HTTPException(status_code=res.status_code, detail="Failed to fetch repo tree")
+    
+    tree = res.json().get("tree", [])
+    
+    # Filter only blobs (files), exclude noise
+    files = [
+        {"path": f["path"], "type": f["type"], "size": f.get("size", 0)}
+        for f in tree
+        if not any(skip in f["path"] for skip in [
+            "node_modules/", "dist/", "build/", ".min.",
+            "__pycache__/", "venv/", ".git/"
+        ])
+    ]
+    
+    return {"repo": repo, "files": files}
