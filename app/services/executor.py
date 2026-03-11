@@ -18,7 +18,7 @@ REPO_INDEX_TTL = 300
 REPO_TREE_TTL = 120
 REFLECTION_TTL = 3600
 
-def _get_cached_repo_tree(repo: str, tree_fetcher):
+async def _get_cached_repo_tree(repo: str, tree_fetcher):
 
     now = time.time()
 
@@ -27,7 +27,7 @@ def _get_cached_repo_tree(repo: str, tree_fetcher):
     if cached and now - cached["ts"] < REPO_TREE_TTL:
         return cached["tree"]
 
-    tree = tree_fetcher()
+    tree = await tree_fetcher()
 
     _REPO_TREE_CACHE[repo] = {
         "tree": tree,
@@ -354,7 +354,7 @@ def _smart_chunk_file(content: str, query: str, max_chunks: int = 3) -> str:
 
     return "\n\n".join([c for s, c in scored[:max_chunks]])
 
-async def _plan_code_task(description: str, repo: str, code_files: list) -> dict:
+async def _plan_code_task(description: str, repo: str, code_files: list, repo_index: list) -> dict:
     """
     Planner AI — decides WHAT to do before execution.
     Returns a structured plan with exact filenames from the repo.
@@ -362,11 +362,19 @@ async def _plan_code_task(description: str, repo: str, code_files: list) -> dict
 
     file_list = "\n".join(code_files[:60])
 
+    file_context = "\n".join(
+        f"{e['file']} | functions: {','.join(e['functions'][:3])}"
+        for e in repo_index[:40]
+    )
+
     planner_prompt = f"""You are a software automation planner.
 
 User task: {description}
 
 Repository: {repo}
+
+Repository structure:
+{file_context}
 
 Available files (ONLY use these exact paths):
 {file_list}
@@ -515,6 +523,8 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
     if ranked_files:
         filtered_files = [f for f in ranked_files if f in filtered_files] or filtered_files
 
+    print(f"DEBUG REPO CONTEXT LOADED")
+    print(f"DEBUG INDEX RANKED FILES")
     print(f"DEBUG INDEX RANKED FILES: {ranked_files[:5]}")
     print(f"DEBUG REFLECTION AVOID FILES: {failed_files}")
     print(f"DEBUG SELECTED FILES: {selected_files}")
@@ -530,14 +540,19 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
                 "summary": "user-selected files"
             }
         else:
-            plan = await _plan_code_task(description, repo, filtered_files)
+            plan = await _plan_code_task(description, repo, filtered_files, repo_index)
     else:
-        plan = await _plan_code_task(description, repo, filtered_files)
+        plan = await _plan_code_task(description, repo, filtered_files, repo_index)
 
+    print(f"DEBUG PLANNER TARGET FILES: {plan['target_files']}")
     print(f"DEBUG PLANNER: selected={plan['target_files']} | plan={plan.get('summary')}")
 
     results = []
     for selected_path in plan["target_files"][:3]:
+        if selected_path not in code_files:
+            raise Exception(f"AI attempted to modify unauthorized file: {selected_path}")
+        print(f"DEBUG EXECUTOR FILE LOCK: {selected_path}")
+
         content_res = await client.get(
             f"https://api.github.com/repos/{repo}/contents/{selected_path}",
             headers=headers
@@ -566,39 +581,72 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
 
         context_code = _smart_chunk_file(original_content, description)
 
-        fix_prompt = (
-            f"You are an expert code reviewer and fixer.\n"
-            f"File: {selected_path}\n\n"
-            f"Task / context: {description or 'Find bugs, security issues, performance problems, bad patterns and fix them'}\n\n"
-            f"Return ONLY the complete fixed code — no explanations, no markdown fences, no comments about changes.\n"
-            f"If the code is already good, return it unchanged.\n\n"
-            f"Code context:\n{context_code}"
-        )
+        fix_prompt = f"""
+You are editing ONE file only.
 
-        fix_res = await _groq_request({
-            "model": "llama-3.3-70b-versatile",
-            "messages": [{"role": "user", "content": fix_prompt}],
-            "max_tokens": 8192,
-            "temperature": 0
-        }, timeout=60.0)
+File path:
+{selected_path}
 
-        if fix_res.status_code != 200:
-            msg = f"AI fix request failed for {selected_path}: {fix_res.status_code}"
-            results.append(msg)
-            _record_reflection(repo, description, selected_path, "failed - " + msg)
+Task:
+{description}
+
+Rules:
+- Modify ONLY this file.
+- Do NOT reference other files.
+- Do NOT invent filenames.
+- Do NOT explain anything.
+
+Return ONLY the full corrected code for this file.
+No markdown.
+No commentary.
+
+Code context:
+{context_code}
+"""
+
+        max_attempts = 2
+        fixed_code = None
+        is_valid = False
+        critic_msg = ""
+        
+        for attempt in range(max_attempts):
+            fix_res = await _groq_request({
+                "model": "llama-3.3-70b-versatile",
+                "messages": [{"role": "user", "content": fix_prompt}],
+                "max_tokens": 8192,
+                "temperature": 0.1,
+                "top_p": 0.9
+            }, timeout=60.0)
+
+            if fix_res.status_code != 200:
+                msg = f"AI fix request failed for {selected_path}: {fix_res.status_code}"
+                results.append(msg)
+                _record_reflection(repo, description, selected_path, "failed - " + msg)
+                break
+
+            fixed_code = fix_res.json()["choices"][0]["message"]["content"].strip()
+            fixed_code = re.sub(r'^```[\w]*\n?', '', fixed_code)
+            fixed_code = re.sub(r'\n?```$', '', fixed_code)
+
+            if fixed_code.strip() == original_content.strip():
+                is_valid = True
+                break
+
+            is_valid, critic_msg = await _critic_validate_fix(original_content, fixed_code, selected_path)
+            if is_valid:
+                break
+                
+            print(f"DEBUG RETRY {attempt+1}: critic rejected → {critic_msg}")
+
+        if not fixed_code:
             continue
-
-        fixed_code = fix_res.json()["choices"][0]["message"]["content"].strip()
-        fixed_code = re.sub(r'^```[\w]*\n?', '', fixed_code)
-        fixed_code = re.sub(r'\n?```$', '', fixed_code)
-
+            
         if fixed_code.strip() == original_content.strip():
             msg = f"✅ No issues found / no changes needed in {selected_path}"
             results.append(msg)
             _record_reflection(repo, description, selected_path, msg)
             continue
-
-        is_valid, critic_msg = await _critic_validate_fix(original_content, fixed_code, selected_path)
+            
         if not is_valid:
             results.append(critic_msg)
             _record_reflection(repo, description, selected_path, "failed - " + critic_msg)
@@ -638,6 +686,10 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
             branch_res = await client.get(f"https://api.github.com/repos/{repo}", headers=headers)
             default_branch = branch_res.json().get("default_branch", "main") if branch_res.status_code == 200 else "main"
             cache_set(branch_cache_key, default_branch)
+
+        commit_target_path = selected_path
+        if selected_path not in commit_target_path:
+            raise Exception("Commit attempted to modify unexpected file")
 
         commit_res = await client.put(
             f"https://api.github.com/repos/{repo}/contents/{selected_path}",

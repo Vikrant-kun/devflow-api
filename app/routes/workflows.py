@@ -6,6 +6,7 @@ from app.database import query, query_one
 from app.models.workflow import SaveWorkflowRequest, RunWorkflowRequest, GenerateWorkflowRequest
 from app.services.executor import execute_workflow
 from app.config import settings
+import re
 
 router = APIRouter(prefix="/workflows", tags=["workflows"])
 
@@ -86,6 +87,7 @@ async def run_workflow(body: RunWorkflowRequest, user: dict = Depends(get_curren
 async def generate_workflow(body: GenerateWorkflowRequest, user: dict = Depends(get_current_user)):
     # Fetch real repo files
     repo_context = ""
+    real_files = []
     try:
         settings_row = query_one(
             "SELECT github_token, selected_repo_full_name FROM user_settings WHERE user_id = %s",
@@ -99,16 +101,18 @@ async def generate_workflow(body: GenerateWorkflowRequest, user: dict = Depends(
                     f"https://api.github.com/repos/{repo}/git/trees/HEAD?recursive=1",
                     headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
                 )
-            if tree_res.status_code == 200:
-                files = [
-                    f["path"] for f in tree_res.json().get("tree", [])
-                    if f["type"] == "blob"
-                    and any(f["path"].endswith(ext) for ext in [".py", ".js", ".jsx", ".ts", ".tsx", ".css", ".html", ".json"])
-                    and not any(s in f["path"] for s in ["node_modules/", "dist/", "build/", ".min."])
-                ]
-                repo_context = f"\n\nREPO: {repo}\nREAL FILES (use ONLY these in node descriptions):\n" + "\n".join(files[:50])
-    except:
-        pass
+
+                if tree_res.status_code == 200:
+                    files = [
+                        f["path"] for f in tree_res.json().get("tree", [])
+                        if f["type"] == "blob"
+                        and any(f["path"].endswith(ext) for ext in [".py", ".js", ".jsx", ".ts", ".tsx", ".css", ".html", ".json"])
+                        and not any(s in f["path"] for s in ["node_modules/", "dist/", "build/", ".min."])
+                    ]
+                    real_files = files
+                    repo_context = f"\n\nREPO: {repo}\nREAL FILES (use ONLY these in node descriptions):\n" + "\n".join(files[:50])
+    except Exception as e:
+        print(f"repo_context failed: {e}")
 
     system_prompt = f"""You are a workflow automation expert. Convert the user's description into a structured pipeline. Return ONLY valid JSON, no markdown:
 {{"name":"Short workflow name","nodes":[{{"id":"1","type":"trigger|action|ai|notification","label":"Short Name","description":"What this step does","icon":"git-branch|zap|sparkles|bell|code|database|mail"}}],"edges":[{{"source":"1","target":"2"}}]}}
@@ -138,7 +142,20 @@ Rules:
         raise HTTPException(status_code=502, detail=f"Groq error: {res.status_code}")
     raw = res.json()["choices"][0]["message"]["content"].replace("```json", "").replace("```", "").strip()
     try:
-        return json.loads(raw)
+        data = json.loads(raw)
+        
+        valid_files = set(real_files)
+        if valid_files:
+            nodes = data.get("nodes", [])
+            for node in nodes:
+                desc = node.get("description", "")
+                matches = re.findall(r"[a-zA-Z0-9_/.-]+\.(?:js|py|ts|jsx|tsx)", desc)
+                for f in matches:
+                    if f not in valid_files:
+                        desc = desc.replace(f, "")
+                node["description"] = desc
+
+        return data
     except:
         raise HTTPException(status_code=422, detail="Failed to parse AI response")
 
