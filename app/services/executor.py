@@ -7,6 +7,47 @@ import base64 as b64
 from datetime import datetime, timezone
 from app.config import settings
 from app.database import query_one
+import json
+
+_TOOL_MEMORY = {}
+_REPO_INDEX_CACHE = {}
+_REPO_TREE_CACHE = {}
+_EXECUTION_REFLECTION = {}
+
+REPO_INDEX_TTL = 300
+REPO_TREE_TTL = 120
+REFLECTION_TTL = 3600
+
+def _get_cached_repo_tree(repo: str, tree_fetcher):
+
+    now = time.time()
+
+    cached = _REPO_TREE_CACHE.get(repo)
+
+    if cached and now - cached["ts"] < REPO_TREE_TTL:
+        return cached["tree"]
+
+    tree = tree_fetcher()
+
+    _REPO_TREE_CACHE[repo] = {
+        "tree": tree,
+        "ts": now
+    }
+
+    return tree
+
+
+def _remember_tool(repo: str, filepath: str):
+    key = f"{repo}:{filepath}"
+    _TOOL_MEMORY[key] = time.time()
+
+def _recent_tools(repo: str):
+    now = time.time()
+    return [
+        k.split(":",1)[1]
+        for k,v in _TOOL_MEMORY.items()
+        if k.startswith(repo) and now-v < 600
+    ]
 
 
 _http_client: httpx.AsyncClient | None = None
@@ -184,6 +225,237 @@ def match_files(code_files: list, filters: list) -> list:
                 break
     return matched or code_files
 
+def _build_repo_index(repo: str, files: dict) -> list:
+
+    index = []
+
+    for path, content in files.items():
+
+        imports = []
+        functions = []
+        keywords = set()
+
+        for line in content.splitlines():
+
+            line = line.strip()
+
+            if line.startswith("import ") or line.startswith("from "):
+                imports.append(line)
+
+            if "def " in line or "function " in line:
+                functions.append(line)
+
+            for token in line.split():
+                if len(token) > 4:
+                    keywords.add(token.lower())
+
+        index.append({
+            "file": path,
+            "imports": imports[:5],
+            "functions": functions[:5],
+            "keywords": list(keywords)[:20]
+        })
+
+    return index
+
+def _rank_files_by_query(query: str, repo_index: list, limit: int = 6):
+
+    words = set(query.lower().split())
+    scored = []
+
+    for entry in repo_index:
+
+        searchable = " ".join(
+            entry["imports"]
+            + entry["functions"]
+            + entry["keywords"]
+            + [entry["file"]]
+        ).lower()
+
+        score = sum(1 for w in words if w in searchable)
+
+        scored.append((score, entry["file"]))
+
+    scored.sort(reverse=True)
+
+    return [f for s, f in scored[:limit]]
+
+def _get_repo_index(repo: str, file_map: dict):
+
+    now = time.time()
+
+    cached = _REPO_INDEX_CACHE.get(repo)
+
+    if cached and now - cached["ts"] < REPO_INDEX_TTL:
+        return cached["index"]
+
+    index = _build_repo_index(repo, file_map)
+
+    _REPO_INDEX_CACHE[repo] = {
+        "index": index,
+        "ts": now
+    }
+
+    return index
+
+def _record_reflection(repo: str, task: str, file: str, result: str):
+
+    key = f"{repo}:{task}"
+
+    entries = _EXECUTION_REFLECTION.setdefault(key, [])
+
+    entries.append({
+        "file": file,
+        "result": result,
+        "ts": time.time()
+    })
+
+    _EXECUTION_REFLECTION[key] = entries[-5:]
+
+def _reflection_penalty(repo: str, task: str):
+
+    key = f"{repo}:{task}"
+
+    history = _EXECUTION_REFLECTION.get(key, [])
+
+    failed_files = [
+        h["file"]
+        for h in history
+        if "failed" in h["result"].lower()
+    ]
+
+    return set(failed_files)
+
+
+def _smart_chunk_file(content: str, query: str, max_chunks: int = 3) -> str:
+    """
+    Selects most relevant sections of code for AI context.
+    Prevents sending entire files while avoiding truncation errors.
+    """
+
+    lines = content.splitlines()
+    size = 120
+    overlap = 30
+    chunks = []
+
+    for i in range(0, len(lines), size - overlap):
+        chunk = "\n".join(lines[i:i+size])
+        chunks.append(chunk)
+
+    query_words = set(query.lower().split())
+    scored = []
+
+    for chunk in chunks:
+        words = set(chunk.lower().split())
+        score = len(query_words & words)
+        scored.append((score, chunk))
+
+    scored.sort(reverse=True)
+
+    return "\n\n".join([c for s, c in scored[:max_chunks]])
+
+async def _plan_code_task(description: str, repo: str, code_files: list) -> dict:
+    """
+    Planner AI — decides WHAT to do before execution.
+    Returns a structured plan with exact filenames from the repo.
+    """
+
+    file_list = "\n".join(code_files[:60])
+
+    planner_prompt = f"""You are a software automation planner.
+
+User task: {description}
+
+Repository: {repo}
+
+Available files (ONLY use these exact paths):
+{file_list}
+
+Return ONLY valid JSON:
+
+{{
+  "target_files": ["exact/path/from/list.js"],
+  "actions": [
+    {{"action":"inspect","file":"exact/path.js","reason":"why"}},
+    {{"action":"fix","file":"exact/path.js","focus":"what to fix"}},
+    {{"action":"validate"}}
+  ],
+  "summary":"one line description"
+}}
+
+Rules:
+- target_files MUST come only from the file list above
+- NEVER invent filenames
+- max 3 files
+- prefer files mentioned in the task
+"""
+
+    res = await _groq_request({
+        "model":"llama-3.3-70b-versatile",
+        "messages":[{"role":"user","content":planner_prompt}],
+        "max_tokens":400,
+        "temperature":0
+    }, timeout=15.0)
+
+    if res.status_code != 200:
+        return {"target_files":[code_files[0]],"actions":[],"summary":"fallback"}
+
+    try:
+        content = res.json()["choices"][0]["message"]["content"].strip()
+        content = content.replace("```json","").replace("```","").strip()
+        plan = json.loads(content)
+
+        plan["target_files"] = [
+            f for f in plan.get("target_files",[])
+            if f in code_files
+        ]
+
+        if not plan["target_files"]:
+            plan["target_files"]=[code_files[0]]
+
+        return plan
+
+    except:
+        return {"target_files":[code_files[0]],"actions":[],"summary":"fallback"}
+
+async def _critic_validate_fix(original_code: str,fixed_code: str,filepath: str) -> tuple[bool,str]:
+    critic_prompt = f"""You are a strict code reviewer.
+
+File: {filepath}
+
+Original code:
+{original_code[:3000]}
+
+Modified code:
+{fixed_code[:3000]}
+
+Check for:
+- syntax errors
+- missing imports
+- broken logic
+- security issues
+- regression bugs
+
+Reply ONLY:
+VALID
+or
+INVALID
+"""
+    res = await _groq_request({
+        "model":"llama-3.3-70b-versatile",
+        "messages":[{"role":"user","content":critic_prompt}],
+        "max_tokens":5,
+        "temperature":0
+    }, timeout=15.0)
+
+    if res.status_code == 200:
+        verdict = res.json()["choices"][0]["message"]["content"].strip().upper()
+        if verdict == "INVALID":
+            return False, f"⚠️ AI fix rejected by critic for {filepath} — original code preserved"
+
+    return True, ""
+
+
 # ── AI Code Edit executor ────────────────────────────────────────────────────
 async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: dict) -> str:
     token = integrations.get("github_token")
@@ -197,17 +469,25 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
     filters = extract_file_filters(description)
 
     client = get_http_client()
-    tree_cache_key = f"tree:{repo}"
-    tree = cache_get(tree_cache_key)
-    if not tree:
-        tree_res = await client.get(
-            f"https://api.github.com/repos/{repo}/git/trees/HEAD?recursive=1",
-            headers=headers
+
+    async def fetch_tree():
+        tree_url = f"https://api.github.com/repos/{repo}/git/trees/HEAD?recursive=1"
+        repo_url = f"https://api.github.com/repos/{repo}"
+        
+        tree_res, repo_res = await asyncio.gather(
+            client.get(tree_url, headers=headers),
+            client.get(repo_url, headers=headers)
         )
+
         if tree_res.status_code != 200:
             raise Exception(f"Cannot access repository tree: {tree_res.json().get('message', tree_res.status_code)}")
-        tree = tree_res.json().get("tree", [])
-        cache_set(tree_cache_key, tree)
+        
+        t = tree_res.json().get("tree", [])
+        if repo_res.status_code == 200:
+            cache_set(f"branch:{repo}", repo_res.json().get("default_branch", "main"))
+        return t
+
+    tree = await _get_cached_repo_tree(repo, fetch_tree)
 
     code_files = [
         f["path"] for f in tree
@@ -219,180 +499,180 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
     if not code_files:
         raise Exception("No relevant code files found in the repository.")
 
+    file_map = {f["path"]: "" for f in tree if f["type"] == "blob"}
+    repo_index = _get_repo_index(repo, file_map)
+    ranked_files = _rank_files_by_query(description, repo_index)
+    failed_files = _reflection_penalty(repo, description)
+    ranked_files = [f for f in ranked_files if f not in failed_files]
+
     filtered_files = match_files(code_files, filters)
 
-    if len(filtered_files) == 1:
-        selected_path = filtered_files[0]
-    else:
-        file_list_str = "\n".join(filtered_files[:60])
-        pick_prompt = (
-            f"You MUST choose ONE file from the exact list below.\n\n"
-            f"Rules:\n"
-            f"- Return ONLY the exact file path as it appears in the list\n"
-            f"- Do NOT explain anything\n"
-            f"- Do NOT invent or modify filenames\n"
-            f"- Do NOT add slashes, prefixes, or extensions\n"
-            f"- If unsure, choose the closest match from the list\n"
-            f"- You MUST return a path from the list, no exceptions\n\n"
-            f"Repository: {repo}\n\n"
-            f"User task: {description or 'find and fix bugs'}\n\n"
-            f"Available files (CHOOSE ONLY FROM THIS LIST):\n{file_list_str}"
-        )
-        pick_res = await _groq_request({
-            "model": "llama-3.3-70b-versatile",
-            "messages": [{"role": "user", "content": pick_prompt}],
-            "max_tokens": 80,
-            "temperature": 0
-        }, timeout=15.0)
-        if pick_res.status_code == 200:
-            ai_choice = pick_res.json()["choices"][0]["message"]["content"].strip().strip('"').strip("'").strip()
-            # strict validation — must be exact match
-            selected_path = ai_choice if ai_choice in filtered_files else filtered_files[0]
-        else:
-            selected_path = filtered_files[0]
+    if ranked_files:
+        filtered_files = [f for f in ranked_files if f in filtered_files] or filtered_files
 
-    content_res = await client.get(
-        f"https://api.github.com/repos/{repo}/contents/{selected_path}",
-        headers=headers
-    )
-    if content_res.status_code != 200:
-        raise Exception(f"Cannot read file {selected_path}: {content_res.json().get('message')}")
+    print(f"DEBUG INDEX RANKED FILES: {ranked_files[:5]}")
+    print(f"DEBUG REFLECTION AVOID FILES: {failed_files}")
 
-    file_data = content_res.json()
-    if file_data.get("encoding") != "base64":
-        raise Exception(f"Unexpected encoding for {selected_path}")
+    plan = await _plan_code_task(description, repo, filtered_files)
+    print(f"DEBUG PLANNER: selected={plan['target_files']} | plan={plan.get('summary')}")
 
-    original_content = b64.b64decode(file_data["content"]).decode("utf-8", errors="replace")
-    sha = file_data["sha"]
-
-    if len(original_content) > 180_000:
-        return f"Skipped {selected_path} — file too large ({len(original_content)//1000} kB)"
-
-    # Use full file up to 6000 tokens (~24000 chars), chunk if larger
-    MAX_CHARS = 24000
-    if len(original_content) > MAX_CHARS:
-        # send first chunk with context
-        original_content = original_content[:MAX_CHARS] + f"\n\n... (file truncated at {MAX_CHARS} chars, fix what you can see)"
-
-    fix_prompt = (
-        f"You are an expert code reviewer and fixer.\n"
-        f"File: {selected_path}\n\n"
-        f"Task / context: {description or 'Find bugs, security issues, performance problems, bad patterns and fix them'}\n\n"
-        f"Return ONLY the complete fixed code — no explanations, no markdown fences, no comments about changes.\n"
-        f"If the code is already good, return it unchanged.\n\n"
-        f"```text\n{original_content}\n```"
-    )
-
-    fix_res = await _groq_request({
-        "model": "llama-3.3-70b-versatile",
-        "messages": [{"role": "user", "content": fix_prompt}],
-        "max_tokens": 8192,
-        "temperature": 0
-    }, timeout=60.0)
-
-    if fix_res.status_code != 200:
-        raise Exception(f"AI fix request failed: {fix_res.status_code}")
-
-    fixed_code = fix_res.json()["choices"][0]["message"]["content"].strip()
-    fixed_code = re.sub(r'^```[\w]*\n?', '', fixed_code)
-    fixed_code = re.sub(r'\n?```$', '', fixed_code)
-
-    if fixed_code.strip() == original_content.strip():
-        return f"✅ No issues found / no changes needed in {selected_path}"
-
-    # Validation pass — second AI checks if fix introduced new bugs
-    validate_prompt = (
-        f"You are a code reviewer. Review this code for obvious bugs, syntax errors, or broken logic.\n\n"
-        f"File: {selected_path}\n\n"
-        f"```\n{fixed_code[:8000]}\n```\n\n"
-        f"Reply ONLY with one word: VALID or INVALID"
-    )
-    val_res = await _groq_request({
-        "model": "llama-3.3-70b-versatile",
-        "messages": [{"role": "user", "content": validate_prompt}],
-        "max_tokens": 5,
-        "temperature": 0
-    }, timeout=15.0)
-
-    if val_res.status_code == 200:
-        verdict = val_res.json()["choices"][0]["message"]["content"].strip().upper()
-        if verdict == "INVALID":
-            return f"⚠️ AI fix rejected by validator for {selected_path} — original code preserved"
-
-    # Basic syntax check
-    if selected_path.endswith('.py'):
-        import ast
-        try:
-            ast.parse(fixed_code)
-        except SyntaxError as e:
-            return f"⚠️ Python syntax error in AI fix for {selected_path}: {e} — original preserved"
-
-    if selected_path.endswith('.js') or selected_path.endswith('.jsx'):
-        # check for obvious JS issues
-        js_issues = []
-        open_braces = fixed_code.count('{') - fixed_code.count('}')
-        open_parens = fixed_code.count('(') - fixed_code.count(')')
-        if abs(open_braces) > 2:
-            js_issues.append(f"unbalanced braces ({open_braces:+d})")
-        if abs(open_parens) > 2:
-            js_issues.append(f"unbalanced parens ({open_parens:+d})")
-        if js_issues:
-            return f"⚠️ JS syntax issues in AI fix for {selected_path}: {', '.join(js_issues)} — original preserved"
-
-    encoded = b64.b64encode(fixed_code.encode("utf-8")).decode("utf-8")
-
-    branch_cache_key = f"branch:{repo}"
-    default_branch = cache_get(branch_cache_key)
-    if not default_branch:
-        branch_res = await client.get(f"https://api.github.com/repos/{repo}", headers=headers)
-        default_branch = branch_res.json().get("default_branch", "main") if branch_res.status_code == 200 else "main"
-        cache_set(branch_cache_key, default_branch)
-
-    commit_res = await client.put(
-        f"https://api.github.com/repos/{repo}/contents/{selected_path}",
-        headers=headers,
-        json={
-            "message": f"DevFlow AI: improved/fixed {selected_path}",
-            "content": encoded,
-            "sha": sha,
-            "branch": default_branch
-        }
-    )
-
-    if commit_res.status_code not in (200, 201):
-        err_body = commit_res.json()
-        raise Exception(f"Commit failed ({commit_res.status_code}): {err_body.get('message')} | repo={repo} | file={selected_path}")
-
-    # Auto PR if description mentions "pr" or "pull request"
-    pr_url = ""
-    if any(k in description.lower() for k in ["pr", "pull request", "open pr", "create pr"]):
-        pr_branch = f"devflow/fix-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
-        # create branch
-        ref_res = await client.get(
-            f"https://api.github.com/repos/{repo}/git/ref/heads/{default_branch}",
+    results = []
+    for selected_path in plan["target_files"][:3]:
+        content_res = await client.get(
+            f"https://api.github.com/repos/{repo}/contents/{selected_path}",
             headers=headers
         )
-        if ref_res.status_code == 200:
-            sha_branch = ref_res.json()["object"]["sha"]
-            await client.post(
-                f"https://api.github.com/repos/{repo}/git/refs",
-                headers=headers,
-                json={"ref": f"refs/heads/{pr_branch}", "sha": sha_branch}
-            )
-            pr_res = await client.post(
-                f"https://api.github.com/repos/{repo}/pulls",
-                headers=headers,
-                json={
-                    "title": f"DevFlow AI: fixes in {selected_path}",
-                    "body": f"Auto-generated PR by DevFlow AI\n\nFixed: `{selected_path}`",
-                    "head": pr_branch,
-                    "base": default_branch
-                }
-            )
-            if pr_res.status_code == 201:
-                pr_url = f"\n🔀 PR created: {pr_res.json()['html_url']}"
+        if content_res.status_code != 200:
+            msg = f"Cannot read file {selected_path}: {content_res.json().get('message')}"
+            results.append(msg)
+            _record_reflection(repo, description, selected_path, "failed - " + msg)
+            continue
 
-    return f"✅ Fixed and committed {selected_path} to {repo}/{default_branch}{pr_url}"
+        file_data = content_res.json()
+        if file_data.get("encoding") != "base64":
+            msg = f"Unexpected encoding for {selected_path}"
+            results.append(msg)
+            _record_reflection(repo, description, selected_path, "failed - " + msg)
+            continue
+
+        original_content = b64.b64decode(file_data["content"]).decode("utf-8", errors="replace")
+        sha = file_data["sha"]
+
+        if len(original_content) > 180_000:
+            msg = f"Skipped {selected_path} — file too large ({len(original_content)//1000} kB)"
+            results.append(msg)
+            _record_reflection(repo, description, selected_path, msg)
+            continue
+
+        context_code = _smart_chunk_file(original_content, description)
+
+        fix_prompt = (
+            f"You are an expert code reviewer and fixer.\n"
+            f"File: {selected_path}\n\n"
+            f"Task / context: {description or 'Find bugs, security issues, performance problems, bad patterns and fix them'}\n\n"
+            f"Return ONLY the complete fixed code — no explanations, no markdown fences, no comments about changes.\n"
+            f"If the code is already good, return it unchanged.\n\n"
+            f"Code context:\n{context_code}"
+        )
+
+        fix_res = await _groq_request({
+            "model": "llama-3.3-70b-versatile",
+            "messages": [{"role": "user", "content": fix_prompt}],
+            "max_tokens": 8192,
+            "temperature": 0
+        }, timeout=60.0)
+
+        if fix_res.status_code != 200:
+            msg = f"AI fix request failed for {selected_path}: {fix_res.status_code}"
+            results.append(msg)
+            _record_reflection(repo, description, selected_path, "failed - " + msg)
+            continue
+
+        fixed_code = fix_res.json()["choices"][0]["message"]["content"].strip()
+        fixed_code = re.sub(r'^```[\w]*\n?', '', fixed_code)
+        fixed_code = re.sub(r'\n?```$', '', fixed_code)
+
+        if fixed_code.strip() == original_content.strip():
+            msg = f"✅ No issues found / no changes needed in {selected_path}"
+            results.append(msg)
+            _record_reflection(repo, description, selected_path, msg)
+            continue
+
+        is_valid, critic_msg = await _critic_validate_fix(original_content, fixed_code, selected_path)
+        if not is_valid:
+            results.append(critic_msg)
+            _record_reflection(repo, description, selected_path, "failed - " + critic_msg)
+            continue
+
+        # Basic syntax check
+        if selected_path.endswith('.py'):
+            import ast
+            try:
+                ast.parse(fixed_code)
+            except SyntaxError as e:
+                msg = f"⚠️ Python syntax error in AI fix for {selected_path}: {e} — original preserved"
+                results.append(msg)
+                _record_reflection(repo, description, selected_path, "failed - syntax")
+                continue
+
+        if selected_path.endswith('.js') or selected_path.endswith('.jsx'):
+            # check for obvious JS issues
+            js_issues = []
+            open_braces = fixed_code.count('{') - fixed_code.count('}')
+            open_parens = fixed_code.count('(') - fixed_code.count(')')
+            if abs(open_braces) > 2:
+                js_issues.append(f"unbalanced braces ({open_braces:+d})")
+            if abs(open_parens) > 2:
+                js_issues.append(f"unbalanced parens ({open_parens:+d})")
+            if js_issues:
+                msg = f"⚠️ JS syntax issues in AI fix for {selected_path}: {', '.join(js_issues)} — original preserved"
+                results.append(msg)
+                _record_reflection(repo, description, selected_path, "failed - syntax")
+                continue
+
+        encoded = b64.b64encode(fixed_code.encode("utf-8")).decode("utf-8")
+
+        branch_cache_key = f"branch:{repo}"
+        default_branch = cache_get(branch_cache_key)
+        if not default_branch:
+            branch_res = await client.get(f"https://api.github.com/repos/{repo}", headers=headers)
+            default_branch = branch_res.json().get("default_branch", "main") if branch_res.status_code == 200 else "main"
+            cache_set(branch_cache_key, default_branch)
+
+        commit_res = await client.put(
+            f"https://api.github.com/repos/{repo}/contents/{selected_path}",
+            headers=headers,
+            json={
+                "message": f"DevFlow AI: improved/fixed {selected_path}",
+                "content": encoded,
+                "sha": sha,
+                "branch": default_branch
+            }
+        )
+
+        if commit_res.status_code not in (200, 201):
+            err_body = commit_res.json()
+            msg = f"Commit failed ({commit_res.status_code}): {err_body.get('message')} | repo={repo} | file={selected_path}"
+            results.append(msg)
+            _record_reflection(repo, description, selected_path, "failed - commit error")
+            continue
+
+        # Auto PR if description mentions "pr" or "pull request"
+        pr_url = ""
+        if any(k in description.lower() for k in ["pr", "pull request", "open pr", "create pr"]):
+            pr_branch = f"devflow/fix-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+            # create branch
+            ref_res = await client.get(
+                f"https://api.github.com/repos/{repo}/git/ref/heads/{default_branch}",
+                headers=headers
+            )
+            if ref_res.status_code == 200:
+                sha_branch = ref_res.json()["object"]["sha"]
+                await client.post(
+                    f"https://api.github.com/repos/{repo}/git/refs",
+                    headers=headers,
+                    json={"ref": f"refs/heads/{pr_branch}", "sha": sha_branch}
+                )
+                pr_res = await client.post(
+                    f"https://api.github.com/repos/{repo}/pulls",
+                    headers=headers,
+                    json={
+                        "title": f"DevFlow AI: fixes in {selected_path}",
+                        "body": f"Auto-generated PR by DevFlow AI\n\nFixed: `{selected_path}`",
+                        "head": pr_branch,
+                        "base": default_branch
+                    }
+                )
+                if pr_res.status_code == 201:
+                    pr_url = f"\n🔀 PR created: {pr_res.json()['html_url']}"
+
+        _remember_tool(repo, selected_path)
+        print(f"DEBUG CRITIC APPROVED: {selected_path}")
+        success_msg = f"✅ Fixed and committed {selected_path} to {repo}/{default_branch}{pr_url}"
+        results.append(success_msg)
+        _record_reflection(repo, description, selected_path, success_msg)
+
+    return "\n".join(results)
 
 
 # ── Helper: evaluate a conditional edge ──────────────────────────────

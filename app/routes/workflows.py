@@ -129,7 +129,8 @@ Rules:
                 "model": "llama-3.3-70b-versatile",
                 "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": body.prompt}],
                 "max_tokens": 1024,
-                "temperature": 0.3
+                "temperature": 0.2,
+                "top_p": 0.9
             },
             timeout=20.0
         )
