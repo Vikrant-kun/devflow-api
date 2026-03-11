@@ -84,14 +84,52 @@ async def run_workflow(body: RunWorkflowRequest, user: dict = Depends(get_curren
 
 @router.post("/generate")
 async def generate_workflow(body: GenerateWorkflowRequest, user: dict = Depends(get_current_user)):
-    system_prompt = """You are a workflow automation expert. Convert the user's description into a structured pipeline. Return ONLY valid JSON, no markdown:
-{"name":"Short workflow name","nodes":[{"id":"1","type":"trigger|action|ai|notification","label":"Short Name","description":"What this step does","icon":"git-branch|zap|sparkles|bell|code|database|mail"}],"edges":[{"source":"1","target":"2"}]}
-Rules: first node always trigger, max 8 nodes, labels 2-4 words."""
+    # Fetch real repo files
+    repo_context = ""
+    try:
+        settings_row = query_one(
+            "SELECT github_token, selected_repo_full_name FROM user_settings WHERE user_id = %s",
+            (user["user_id"],)
+        )
+        if settings_row and settings_row.get("github_token") and settings_row.get("selected_repo_full_name"):
+            token = settings_row["github_token"]
+            repo = settings_row["selected_repo_full_name"]
+            async with httpx.AsyncClient() as client:
+                tree_res = await client.get(
+                    f"https://api.github.com/repos/{repo}/git/trees/HEAD?recursive=1",
+                    headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+                )
+            if tree_res.status_code == 200:
+                files = [
+                    f["path"] for f in tree_res.json().get("tree", [])
+                    if f["type"] == "blob"
+                    and any(f["path"].endswith(ext) for ext in [".py", ".js", ".jsx", ".ts", ".tsx", ".css", ".html", ".json"])
+                    and not any(s in f["path"] for s in ["node_modules/", "dist/", "build/", ".min."])
+                ]
+                repo_context = f"\n\nREPO: {repo}\nREAL FILES (use ONLY these in node descriptions):\n" + "\n".join(files[:50])
+    except:
+        pass
+
+    system_prompt = f"""You are a workflow automation expert. Convert the user's description into a structured pipeline. Return ONLY valid JSON, no markdown:
+{{"name":"Short workflow name","nodes":[{{"id":"1","type":"trigger|action|ai|notification","label":"Short Name","description":"What this step does","icon":"git-branch|zap|sparkles|bell|code|database|mail"}}],"edges":[{{"source":"1","target":"2"}}]}}
+
+Rules:
+- First node always trigger
+- Max 8 nodes, labels 2-4 words
+- In node descriptions, ONLY reference files that exist in the repo file list below
+- NEVER invent filenames like main.py, utils.py — use ONLY real files from the list
+- If no specific file is mentioned by user, reference the most relevant real file{repo_context}"""
+
     async with httpx.AsyncClient() as client:
         res = await client.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {settings.GROQ_API_KEY}"},
-            json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": body.prompt}], "max_tokens": 1024, "temperature": 0.7},
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": body.prompt}],
+                "max_tokens": 1024,
+                "temperature": 0.4
+            },
             timeout=20.0
         )
     if res.status_code != 200:
@@ -101,3 +139,5 @@ Rules: first node always trigger, max 8 nodes, labels 2-4 words."""
         return json.loads(raw)
     except:
         raise HTTPException(status_code=422, detail="Failed to parse AI response")
+
+        
