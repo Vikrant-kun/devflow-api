@@ -74,7 +74,7 @@ class BranchInfo(BaseModel):
 # -----------------------------
 # SAVE SETTINGS / TOKEN
 # -----------------------------
-@router.post("/token")
+@router.post("/token/")
 async def save_settings(body: dict, user: dict = Depends(get_current_user)):
 
     if "token" in body:
