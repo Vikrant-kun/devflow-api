@@ -226,21 +226,27 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
     else:
         file_list_str = "\n".join(filtered_files[:60])
         pick_prompt = (
+            f"You MUST choose ONE file from the exact list below.\n\n"
+            f"Rules:\n"
+            f"- Return ONLY the exact file path as it appears in the list\n"
+            f"- Do NOT explain anything\n"
+            f"- Do NOT invent or modify filenames\n"
+            f"- Do NOT add slashes, prefixes, or extensions\n"
+            f"- If unsure, choose the closest match from the list\n"
+            f"- You MUST return a path from the list, no exceptions\n\n"
             f"Repository: {repo}\n\n"
-            f"Task: {description or 'find and fix bugs'}\n\n"
-            f"IMPORTANT: You MUST select a file from THIS EXACT LIST ONLY. "
-            f"Do NOT invent or guess filenames. Do NOT use files from other repos. "
-            f"Return ONLY the exact file path as it appears below, nothing else.\n\n"
-            f"Available files:\n{file_list_str}"
+            f"User task: {description or 'find and fix bugs'}\n\n"
+            f"Available files (CHOOSE ONLY FROM THIS LIST):\n{file_list_str}"
         )
         pick_res = await _groq_request({
             "model": "llama-3.3-70b-versatile",
             "messages": [{"role": "user", "content": pick_prompt}],
             "max_tokens": 80,
-            "temperature": 0.1
+            "temperature": 0
         }, timeout=15.0)
         if pick_res.status_code == 200:
-            ai_choice = pick_res.json()["choices"][0]["message"]["content"].strip().strip('"').strip("'")
+            ai_choice = pick_res.json()["choices"][0]["message"]["content"].strip().strip('"').strip("'").strip()
+            # strict validation — must be exact match
             selected_path = ai_choice if ai_choice in filtered_files else filtered_files[0]
         else:
             selected_path = filtered_files[0]
@@ -262,10 +268,11 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
     if len(original_content) > 180_000:
         return f"Skipped {selected_path} — file too large ({len(original_content)//1000} kB)"
 
-    # Truncate large files to save tokens
-    lines = original_content.splitlines()
-    if len(lines) > 300:
-        original_content = "\n".join(lines[:300]) + f"\n\n... ({len(lines) - 300} more lines truncated for token efficiency)"
+    # Use full file up to 6000 tokens (~24000 chars), chunk if larger
+    MAX_CHARS = 24000
+    if len(original_content) > MAX_CHARS:
+        # send first chunk with context
+        original_content = original_content[:MAX_CHARS] + f"\n\n... (file truncated at {MAX_CHARS} chars, fix what you can see)"
 
     fix_prompt = (
         f"You are an expert code reviewer and fixer.\n"
@@ -280,7 +287,7 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
         "model": "llama-3.3-70b-versatile",
         "messages": [{"role": "user", "content": fix_prompt}],
         "max_tokens": 8192,
-        "temperature": 0.15
+        "temperature": 0
     }, timeout=60.0)
 
     if fix_res.status_code != 200:
@@ -292,6 +299,45 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
 
     if fixed_code.strip() == original_content.strip():
         return f"✅ No issues found / no changes needed in {selected_path}"
+
+    # Validation pass — second AI checks if fix introduced new bugs
+    validate_prompt = (
+        f"You are a code reviewer. Review this code for obvious bugs, syntax errors, or broken logic.\n\n"
+        f"File: {selected_path}\n\n"
+        f"```\n{fixed_code[:8000]}\n```\n\n"
+        f"Reply ONLY with one word: VALID or INVALID"
+    )
+    val_res = await _groq_request({
+        "model": "llama-3.3-70b-versatile",
+        "messages": [{"role": "user", "content": validate_prompt}],
+        "max_tokens": 5,
+        "temperature": 0
+    }, timeout=15.0)
+
+    if val_res.status_code == 200:
+        verdict = val_res.json()["choices"][0]["message"]["content"].strip().upper()
+        if verdict == "INVALID":
+            return f"⚠️ AI fix rejected by validator for {selected_path} — original code preserved"
+
+    # Basic syntax check
+    if selected_path.endswith('.py'):
+        import ast
+        try:
+            ast.parse(fixed_code)
+        except SyntaxError as e:
+            return f"⚠️ Python syntax error in AI fix for {selected_path}: {e} — original preserved"
+
+    if selected_path.endswith('.js') or selected_path.endswith('.jsx'):
+        # check for obvious JS issues
+        js_issues = []
+        open_braces = fixed_code.count('{') - fixed_code.count('}')
+        open_parens = fixed_code.count('(') - fixed_code.count(')')
+        if abs(open_braces) > 2:
+            js_issues.append(f"unbalanced braces ({open_braces:+d})")
+        if abs(open_parens) > 2:
+            js_issues.append(f"unbalanced parens ({open_parens:+d})")
+        if js_issues:
+            return f"⚠️ JS syntax issues in AI fix for {selected_path}: {', '.join(js_issues)} — original preserved"
 
     encoded = b64.b64encode(fixed_code.encode("utf-8")).decode("utf-8")
 

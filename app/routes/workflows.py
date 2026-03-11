@@ -117,7 +117,8 @@ Rules:
 - First node always trigger
 - Max 8 nodes, labels 2-4 words
 - In node descriptions, ONLY reference files that exist in the repo file list below
-- NEVER invent filenames like main.py, utils.py — use ONLY real files from the list
+- NEVER invent filenames. ONLY use files from the REAL FILES list provided.
+- Node descriptions must reference EXACT filenames from the list, not guesses.
 - If no specific file is mentioned by user, reference the most relevant real file{repo_context}"""
 
     async with httpx.AsyncClient() as client:
@@ -128,7 +129,7 @@ Rules:
                 "model": "llama-3.3-70b-versatile",
                 "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": body.prompt}],
                 "max_tokens": 1024,
-                "temperature": 0.4
+                "temperature": 0.3
             },
             timeout=20.0
         )
