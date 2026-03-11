@@ -1,11 +1,58 @@
 import httpx
 import asyncio
+import time
 import re
 import fnmatch
 import base64 as b64
 from datetime import datetime, timezone
 from app.config import settings
 from app.database import query_one
+
+
+_http_client: httpx.AsyncClient | None = None
+
+def get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, connect=5.0),
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
+        )
+    return _http_client
+
+
+_cache: dict = {}
+CACHE_TTL = 60  # seconds
+
+def cache_get(key: str):
+    if key in _cache:
+        val, ts = _cache[key]
+        if time.time() - ts < CACHE_TTL:
+            return val
+        del _cache[key]
+    return None
+
+def cache_set(key: str, val):
+    _cache[key] = (val, time.time())
+
+
+async def _groq_request(payload: dict, timeout: float = 60.0):
+    client = get_http_client()
+    for attempt in range(3):
+        res = await client.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {settings.GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json=payload,
+            timeout=timeout
+        )
+        if res.status_code == 429:
+            await asyncio.sleep(2 ** attempt)
+            continue
+        return res
+    raise Exception("Groq rate limit exceeded after 3 retries")
 
 
 # ── Fetch user integrations ───────────────────────────────────────
@@ -70,24 +117,24 @@ async def _execute_email(node_data: dict, context: dict) -> str:
     </div>
     """
 
-    async with httpx.AsyncClient() as client:
-        res = await client.post(
-            "https://api.brevo.com/v3/smtp/email",
-            headers={
-                "api-key": settings.BREVO_API_KEY,
-                "Content-Type": "application/json"
-            },
-            json={
-                "sender": {"name": "DevFlow AI", "email": settings.GMAIL_USER},
-                "to": [{"email": to_email}],
-                "subject": f"DevFlow Pipeline: {label}",
-                "htmlContent": html
-            },
-            timeout=15.0
-        )
-        if res.status_code in (200, 201):
-            return f"✅ Email sent to {to_email}"
-        raise Exception(f"Email failed: {res.status_code} {res.text}")
+    client = get_http_client()
+    res = await client.post(
+        "https://api.brevo.com/v3/smtp/email",
+        headers={
+            "api-key": settings.BREVO_API_KEY,
+            "Content-Type": "application/json"
+        },
+        json={
+            "sender": {"name": "DevFlow AI", "email": settings.GMAIL_USER},
+            "to": [{"email": to_email}],
+            "subject": f"DevFlow Pipeline: {label}",
+            "htmlContent": html
+        },
+        timeout=15.0
+    )
+    if res.status_code in (200, 201):
+        return f"✅ Email sent to {to_email}"
+    raise Exception(f"Email failed: {res.status_code} {res.text}")
 
 
 # Extract file filters from description
@@ -140,157 +187,156 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
 
     filters = extract_file_filters(description)
 
-    async with httpx.AsyncClient(timeout=45.0) as client:
+    client = get_http_client()
+    tree_cache_key = f"tree:{repo}"
+    tree = cache_get(tree_cache_key)
+    if not tree:
         tree_res = await client.get(
             f"https://api.github.com/repos/{repo}/git/trees/HEAD?recursive=1",
             headers=headers
         )
         if tree_res.status_code != 200:
             raise Exception(f"Cannot access repository tree: {tree_res.json().get('message', tree_res.status_code)}")
-
         tree = tree_res.json().get("tree", [])
-        code_files = [
-            f["path"] for f in tree
-            if f["type"] == "blob"
-            and any(f["path"].lower().endswith(ext) for ext in [".py", ".js", ".jsx", ".ts", ".tsx", ".css", ".html", ".json", ".yaml", ".yml"])
-            and not any(skip in f["path"].lower() for skip in ["node_modules/", "dist/", "build/", ".min.", "vendor/", "__pycache__/", "venv/"])
-        ]
+        cache_set(tree_cache_key, tree)
 
-        if not code_files:
-            raise Exception("No relevant code files found in the repository.")
+    code_files = [
+        f["path"] for f in tree
+        if f["type"] == "blob"
+        and any(f["path"].lower().endswith(ext) for ext in [".py", ".js", ".jsx", ".ts", ".tsx", ".css", ".html", ".json", ".yaml", ".yml"])
+        and not any(skip in f["path"].lower() for skip in ["node_modules/", "dist/", "build/", ".min.", "vendor/", "__pycache__/", "venv/"])
+    ]
 
-        filtered_files = match_files(code_files, filters)
+    if not code_files:
+        raise Exception("No relevant code files found in the repository.")
 
-        if len(filtered_files) == 1:
-            selected_path = filtered_files[0]
+    filtered_files = match_files(code_files, filters)
+
+    if len(filtered_files) == 1:
+        selected_path = filtered_files[0]
+    else:
+        file_list_str = "\n".join(filtered_files[:60])
+        pick_prompt = (
+            f"Repository: {repo}\n\n"
+            f"Task description: {description or 'find and fix bugs / improve code'}\n\n"
+            f"From this list of files, select the SINGLE most relevant file to work on for this task.\n"
+            f"Return ONLY the full file path, nothing else.\n"
+            f"Files:\n{file_list_str}"
+        )
+        pick_res = await _groq_request({
+            "model": "llama-3.3-70b-versatile",
+            "messages": [{"role": "user", "content": pick_prompt}],
+            "max_tokens": 80,
+            "temperature": 0.1
+        }, timeout=15.0)
+        if pick_res.status_code == 200:
+            ai_choice = pick_res.json()["choices"][0]["message"]["content"].strip().strip('"').strip("'")
+            selected_path = ai_choice if ai_choice in filtered_files else filtered_files[0]
         else:
-            file_list_str = "\n".join(filtered_files[:60])
-            pick_prompt = (
-                f"Repository: {repo}\n\n"
-                f"Task description: {description or 'find and fix bugs / improve code'}\n\n"
-                f"From this list of files, select the SINGLE most relevant file to work on for this task.\n"
-                f"Return ONLY the full file path, nothing else.\n"
-                f"Files:\n{file_list_str}"
-            )
-            pick_res = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}", "Content-Type": "application/json"},
-                json={
-                    "model": "llama-3.3-70b-versatile",
-                    "messages": [{"role": "user", "content": pick_prompt}],
-                    "max_tokens": 80,
-                    "temperature": 0.1
-                },
-                timeout=15.0
-            )
-            if pick_res.status_code == 200:
-                ai_choice = pick_res.json()["choices"][0]["message"]["content"].strip().strip('"').strip("'")
-                selected_path = ai_choice if ai_choice in filtered_files else filtered_files[0]
-            else:
-                selected_path = filtered_files[0]
+            selected_path = filtered_files[0]
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        content_res = await client.get(
-            f"https://api.github.com/repos/{repo}/contents/{selected_path}",
-            headers=headers
-        )
-        if content_res.status_code != 200:
-            raise Exception(f"Cannot read file {selected_path}: {content_res.json().get('message')}")
+    content_res = await client.get(
+        f"https://api.github.com/repos/{repo}/contents/{selected_path}",
+        headers=headers
+    )
+    if content_res.status_code != 200:
+        raise Exception(f"Cannot read file {selected_path}: {content_res.json().get('message')}")
 
-        file_data = content_res.json()
-        if file_data.get("encoding") != "base64":
-            raise Exception(f"Unexpected encoding for {selected_path}")
+    file_data = content_res.json()
+    if file_data.get("encoding") != "base64":
+        raise Exception(f"Unexpected encoding for {selected_path}")
 
-        original_content = b64.b64decode(file_data["content"]).decode("utf-8", errors="replace")
-        sha = file_data["sha"]
+    original_content = b64.b64decode(file_data["content"]).decode("utf-8", errors="replace")
+    sha = file_data["sha"]
 
-        if len(original_content) > 180_000:
-            return f"Skipped {selected_path} — file too large ({len(original_content)//1000} kB)"
+    if len(original_content) > 180_000:
+        return f"Skipped {selected_path} — file too large ({len(original_content)//1000} kB)"
 
-        fix_prompt = (
-            f"You are an expert code reviewer and fixer.\n"
-            f"File: {selected_path}\n\n"
-            f"Task / context: {description or 'Find bugs, security issues, performance problems, bad patterns and fix them'}\n\n"
-            f"Return ONLY the complete fixed code — no explanations, no markdown fences, no comments about changes.\n"
-            f"If the code is already good, return it unchanged.\n\n"
-            f"```text\n{original_content}\n```"
-        )
+    # Truncate large files to save tokens
+    lines = original_content.splitlines()
+    if len(lines) > 300:
+        original_content = "\n".join(lines[:300]) + f"\n\n... ({len(lines) - 300} more lines truncated for token efficiency)"
 
-        fix_res = await client.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": "llama-3.3-70b-versatile",
-                "messages": [{"role": "user", "content": fix_prompt}],
-                "max_tokens": 8192,
-                "temperature": 0.15
-            },
-            timeout=60.0
-        )
+    fix_prompt = (
+        f"You are an expert code reviewer and fixer.\n"
+        f"File: {selected_path}\n\n"
+        f"Task / context: {description or 'Find bugs, security issues, performance problems, bad patterns and fix them'}\n\n"
+        f"Return ONLY the complete fixed code — no explanations, no markdown fences, no comments about changes.\n"
+        f"If the code is already good, return it unchanged.\n\n"
+        f"```text\n{original_content}\n```"
+    )
 
-        if fix_res.status_code != 200:
-            raise Exception(f"AI fix request failed: {fix_res.status_code}")
+    fix_res = await _groq_request({
+        "model": "llama-3.3-70b-versatile",
+        "messages": [{"role": "user", "content": fix_prompt}],
+        "max_tokens": 8192,
+        "temperature": 0.15
+    }, timeout=60.0)
 
-        fixed_code = fix_res.json()["choices"][0]["message"]["content"].strip()
-        fixed_code = re.sub(r'^```[\w]*\n?', '', fixed_code)
-        fixed_code = re.sub(r'\n?```$', '', fixed_code)
+    if fix_res.status_code != 200:
+        raise Exception(f"AI fix request failed: {fix_res.status_code}")
 
-        if fixed_code.strip() == original_content.strip():
-            return f"✅ No issues found / no changes needed in {selected_path}"
+    fixed_code = fix_res.json()["choices"][0]["message"]["content"].strip()
+    fixed_code = re.sub(r'^```[\w]*\n?', '', fixed_code)
+    fixed_code = re.sub(r'\n?```$', '', fixed_code)
 
-        encoded = b64.b64encode(fixed_code.encode("utf-8")).decode("utf-8")
+    if fixed_code.strip() == original_content.strip():
+        return f"✅ No issues found / no changes needed in {selected_path}"
 
-        branch_res = await client.get(
-            f"https://api.github.com/repos/{repo}",
-            headers=headers
-        )
+    encoded = b64.b64encode(fixed_code.encode("utf-8")).decode("utf-8")
+
+    branch_cache_key = f"branch:{repo}"
+    default_branch = cache_get(branch_cache_key)
+    if not default_branch:
+        branch_res = await client.get(f"https://api.github.com/repos/{repo}", headers=headers)
         default_branch = branch_res.json().get("default_branch", "main") if branch_res.status_code == 200 else "main"
+        cache_set(branch_cache_key, default_branch)
 
-        commit_res = await client.put(
-            f"https://api.github.com/repos/{repo}/contents/{selected_path}",
-            headers=headers,
-            json={
-                "message": f"DevFlow AI: improved/fixed {selected_path}",
-                "content": encoded,
-                "sha": sha,
-                "branch": default_branch
-            }
+    commit_res = await client.put(
+        f"https://api.github.com/repos/{repo}/contents/{selected_path}",
+        headers=headers,
+        json={
+            "message": f"DevFlow AI: improved/fixed {selected_path}",
+            "content": encoded,
+            "sha": sha,
+            "branch": default_branch
+        }
+    )
+
+    if commit_res.status_code not in (200, 201):
+        err_body = commit_res.json()
+        raise Exception(f"Commit failed ({commit_res.status_code}): {err_body.get('message')} | repo={repo} | file={selected_path}")
+
+    # Auto PR if description mentions "pr" or "pull request"
+    pr_url = ""
+    if any(k in description.lower() for k in ["pr", "pull request", "open pr", "create pr"]):
+        pr_branch = f"devflow/fix-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+        # create branch
+        ref_res = await client.get(
+            f"https://api.github.com/repos/{repo}/git/ref/heads/{default_branch}",
+            headers=headers
         )
-
-        if commit_res.status_code not in (200, 201):
-            err_body = commit_res.json()
-            raise Exception(f"Commit failed ({commit_res.status_code}): {err_body.get('message')} | repo={repo} | file={selected_path}")
-
-        # Auto PR if description mentions "pr" or "pull request"
-        pr_url = ""
-        if any(k in description.lower() for k in ["pr", "pull request", "open pr", "create pr"]):
-            pr_branch = f"devflow/fix-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
-            # create branch
-            ref_res = await client.get(
-                f"https://api.github.com/repos/{repo}/git/ref/heads/{default_branch}",
-                headers=headers
+        if ref_res.status_code == 200:
+            sha_branch = ref_res.json()["object"]["sha"]
+            await client.post(
+                f"https://api.github.com/repos/{repo}/git/refs",
+                headers=headers,
+                json={"ref": f"refs/heads/{pr_branch}", "sha": sha_branch}
             )
-            if ref_res.status_code == 200:
-                sha_branch = ref_res.json()["object"]["sha"]
-                await client.post(
-                    f"https://api.github.com/repos/{repo}/git/refs",
-                    headers=headers,
-                    json={"ref": f"refs/heads/{pr_branch}", "sha": sha_branch}
-                )
-                pr_res = await client.post(
-                    f"https://api.github.com/repos/{repo}/pulls",
-                    headers=headers,
-                    json={
-                        "title": f"DevFlow AI: fixes in {selected_path}",
-                        "body": f"Auto-generated PR by DevFlow AI\n\nFixed: `{selected_path}`",
-                        "head": pr_branch,
-                        "base": default_branch
-                    }
-                )
-                if pr_res.status_code == 201:
-                    pr_url = f"\n🔀 PR created: {pr_res.json()['html_url']}"
+            pr_res = await client.post(
+                f"https://api.github.com/repos/{repo}/pulls",
+                headers=headers,
+                json={
+                    "title": f"DevFlow AI: fixes in {selected_path}",
+                    "body": f"Auto-generated PR by DevFlow AI\n\nFixed: `{selected_path}`",
+                    "head": pr_branch,
+                    "base": default_branch
+                }
+            )
+            if pr_res.status_code == 201:
+                pr_url = f"\n🔀 PR created: {pr_res.json()['html_url']}"
 
-        return f"✅ Fixed and committed {selected_path} to {repo}/{default_branch}{pr_url}"
+    return f"✅ Fixed and committed {selected_path} to {repo}/{default_branch}{pr_url}"
 
 
 # ── Helper: evaluate a conditional edge ──────────────────────────────
@@ -315,21 +361,15 @@ Important context:
 Does the parent output satisfy this condition?
 Reply with ONLY: true or false"""
 
-    async with httpx.AsyncClient() as client:
-        res = await client.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": "llama-3.3-70b-versatile",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 5,
-                "temperature": 0
-            },
-            timeout=10.0
-        )
-        if res.status_code == 200:
-            answer = res.json()["choices"][0]["message"]["content"].strip().lower()
-            return answer == "true"
+    res = await _groq_request({
+        "model": "llama-3.3-70b-versatile",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 5,
+        "temperature": 0
+    }, timeout=10.0)
+    if res.status_code == 200:
+        answer = res.json()["choices"][0]["message"]["content"].strip().lower()
+        return answer == "true"
     return True  # safe fallback
 
 
@@ -376,20 +416,14 @@ Rules:
 
 Return ONLY one word from the list above, nothing else."""
 
-    async with httpx.AsyncClient() as client:
-        res = await client.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": "llama-3.3-70b-versatile",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 10,
-                "temperature": 0
-            },
-            timeout=10.0
-        )
-        if res.status_code == 200:
-            return res.json()["choices"][0]["message"]["content"].strip().lower()
+    res = await _groq_request({
+        "model": "llama-3.3-70b-versatile",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 10,
+        "temperature": 0
+    }, timeout=10.0)
+    if res.status_code == 200:
+        return res.json()["choices"][0]["message"]["content"].strip().lower()
     return "ai"  # safe fallback
 
 
@@ -416,11 +450,11 @@ async def _execute_node(node_type: str, node_data: dict, user_id: str, integrati
             )
             code_was_fixed = "✅ Fixed and committed" in ancestor_text
             code_was_clean = (
-    "✅ No issues found" in ancestor_text or
-    "no issues found" in ancestor_text.lower() or
-    "no changes needed" in ancestor_text.lower() or
-    "✅ no" in ancestor_text.lower()
-)
+                "✅ No issues found" in ancestor_text or
+                "no issues found" in ancestor_text.lower() or
+                "no changes needed" in ancestor_text.lower() or
+                "✅ no" in ancestor_text.lower()
+            )
 
             # Use AI to decide if this is an error email or success email
             node_text = (label + " " + description).lower()
@@ -472,76 +506,76 @@ async def _execute_github(node_data: dict, integrations: dict, context: dict) ->
 
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
 
-    async with httpx.AsyncClient() as client:
-        if any(k in label for k in ["branch", "create branch"]):
-            branch_name = f"devflow/{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
-            r = await client.get(f"https://api.github.com/repos/{repo}", headers=headers)
-            r.raise_for_status()
-            default_branch = r.json()["default_branch"]
-            r2 = await client.get(f"https://api.github.com/repos/{repo}/git/ref/heads/{default_branch}", headers=headers)
-            r2.raise_for_status()
-            sha = r2.json()["object"]["sha"]
-            r3 = await client.post(
-                f"https://api.github.com/repos/{repo}/git/refs",
-                headers=headers,
-                json={"ref": f"refs/heads/{branch_name}", "sha": sha}
-            )
-            r3.raise_for_status()
-            return f"Branch created: {branch_name} in {repo}"
+    client = get_http_client()
+    if any(k in label for k in ["branch", "create branch"]):
+        branch_name = f"devflow/{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+        r = await client.get(f"https://api.github.com/repos/{repo}", headers=headers)
+        r.raise_for_status()
+        default_branch = r.json()["default_branch"]
+        r2 = await client.get(f"https://api.github.com/repos/{repo}/git/ref/heads/{default_branch}", headers=headers)
+        r2.raise_for_status()
+        sha = r2.json()["object"]["sha"]
+        r3 = await client.post(
+            f"https://api.github.com/repos/{repo}/git/refs",
+            headers=headers,
+            json={"ref": f"refs/heads/{branch_name}", "sha": sha}
+        )
+        r3.raise_for_status()
+        return f"Branch created: {branch_name} in {repo}"
 
-        elif any(k in label for k in ["pr", "pull request", "open pr"]):
-            parent_output = context.get("parent_outputs", [""])
-            body = parent_output[-1] if parent_output else description or "Automated PR via DevFlow"
-            r = await client.get(f"https://api.github.com/repos/{repo}", headers=headers)
-            default_branch = r.json().get("default_branch", "main")
-            r2 = await client.post(
-                f"https://api.github.com/repos/{repo}/pulls",
-                headers=headers,
-                json={
-                    "title": f"DevFlow: {node_data.get('label', 'Automated PR')}",
-                    "body": body,
-                    "head": default_branch,
-                    "base": default_branch
-                }
-            )
-            if r2.status_code in [200, 201]:
-                pr = r2.json()
-                return f"PR #{pr['number']} created: {pr['html_url']}"
-            return f"GitHub action completed on {repo}"
+    elif any(k in label for k in ["pr", "pull request", "open pr"]):
+        parent_output = context.get("parent_outputs", [""])
+        body = parent_output[-1] if parent_output else description or "Automated PR via DevFlow"
+        r = await client.get(f"https://api.github.com/repos/{repo}", headers=headers)
+        default_branch = r.json().get("default_branch", "main")
+        r2 = await client.post(
+            f"https://api.github.com/repos/{repo}/pulls",
+            headers=headers,
+            json={
+                "title": f"DevFlow: {node_data.get('label', 'Automated PR')}",
+                "body": body,
+                "head": default_branch,
+                "base": default_branch
+            }
+        )
+        if r2.status_code in [200, 201]:
+            pr = r2.json()
+            return f"PR #{pr['number']} created: {pr['html_url']}"
+        return f"GitHub action completed on {repo}"
 
-        elif any(k in label for k in ["commit", "push", "upload", "file"]):
-            parent_output = "\n".join(context.get("parent_outputs", []))
-            content = parent_output or description or f"# Generated by DevFlow\n\nPipeline ran at {datetime.now(timezone.utc).isoformat()}"
-            filename = f"devflow-output-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.md"
-            encoded = b64.b64encode(content.encode()).decode()
-            r = await client.put(
-                f"https://api.github.com/repos/{repo}/contents/{filename}",
-                headers=headers,
-                json={
-                    "message": f"DevFlow: {node_data.get('label', 'automated commit')}",
-                    "content": encoded
-                }
-            )
-            if r.status_code in [200, 201]:
-                return f"Committed {filename} to {repo}"
-            raise Exception(f"GitHub commit failed: {r.json().get('message', r.status_code)}")
+    elif any(k in label for k in ["commit", "push", "upload", "file"]):
+        parent_output = "\n".join(context.get("parent_outputs", []))
+        content = parent_output or description or f"# Generated by DevFlow\n\nPipeline ran at {datetime.now(timezone.utc).isoformat()}"
+        filename = f"devflow-output-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.md"
+        encoded = b64.b64encode(content.encode()).decode()
+        r = await client.put(
+            f"https://api.github.com/repos/{repo}/contents/{filename}",
+            headers=headers,
+            json={
+                "message": f"DevFlow: {node_data.get('label', 'automated commit')}",
+                "content": encoded
+            }
+        )
+        if r.status_code in [200, 201]:
+            return f"Committed {filename} to {repo}"
+        raise Exception(f"GitHub commit failed: {r.json().get('message', r.status_code)}")
 
-        else:
-            parent_output = "\n".join(context.get("parent_outputs", []))
-            body = parent_output or description or "Automated issue created by DevFlow pipeline"
-            r = await client.post(
-                f"https://api.github.com/repos/{repo}/issues",
-                headers=headers,
-                json={
-                    "title": node_data.get("label", "DevFlow Issue"),
-                    "body": body,
-                    "labels": ["devflow", "automated"]
-                }
-            )
-            if r.status_code == 201:
-                issue = r.json()
-                return f"Issue #{issue['number']} created: {issue['html_url']}"
-            raise Exception(f"GitHub API error: {r.json().get('message', r.status_code)}")
+    else:
+        parent_output = "\n".join(context.get("parent_outputs", []))
+        body = parent_output or description or "Automated issue created by DevFlow pipeline"
+        r = await client.post(
+            f"https://api.github.com/repos/{repo}/issues",
+            headers=headers,
+            json={
+                "title": node_data.get("label", "DevFlow Issue"),
+                "body": body,
+                "labels": ["devflow", "automated"]
+            }
+        )
+        if r.status_code == 201:
+            issue = r.json()
+            return f"Issue #{issue['number']} created: {issue['html_url']}"
+        raise Exception(f"GitHub API error: {r.json().get('message', r.status_code)}")
 
 
 # ── Other executors ───────────────────────────────────────────────
@@ -556,36 +590,35 @@ Previous step output: {parent_output or 'None'}
 Your task: {description or label}
 Respond with a concise, actionable result (2-4 sentences max)."""
 
-    async with httpx.AsyncClient() as client:
-        if model == "gpt4" and settings.OPENAI_API_KEY:
-            res = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={"Content-Type": "application/json", "Authorization": f"Bearer {settings.OPENAI_API_KEY}"},
-                json={"model": "gpt-4o", "messages": [{"role": "user", "content": prompt}], "max_tokens": 300},
-                timeout=20.0
-            )
-            res.raise_for_status()
-            return res.json()["choices"][0]["message"]["content"].strip()
+    client = get_http_client()
+    if model == "gpt4" and settings.OPENAI_API_KEY:
+        res = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {settings.OPENAI_API_KEY}"},
+            json={"model": "gpt-4o", "messages": [{"role": "user", "content": prompt}], "max_tokens": 300},
+            timeout=20.0
+        )
+        res.raise_for_status()
+        return res.json()["choices"][0]["message"]["content"].strip()
 
-        elif model == "gemini" and settings.GEMINI_API_KEY:
-            res = await client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={settings.GEMINI_API_KEY}",
-                headers={"Content-Type": "application/json"},
-                json={"contents": [{"parts": [{"text": prompt}]}]},
-                timeout=20.0
-            )
-            res.raise_for_status()
-            return res.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+    elif model == "gemini" and settings.GEMINI_API_KEY:
+        res = await client.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={settings.GEMINI_API_KEY}",
+            headers={"Content-Type": "application/json"},
+            json={"contents": [{"parts": [{"text": prompt}]}]},
+            timeout=20.0
+        )
+        res.raise_for_status()
+        return res.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
 
-        else:
-            res = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Content-Type": "application/json", "Authorization": f"Bearer {settings.GROQ_API_KEY}"},
-                json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": prompt}], "max_tokens": 300},
-                timeout=20.0
-            )
-            res.raise_for_status()
-            return res.json()["choices"][0]["message"]["content"].strip()
+    else:
+        res = await _groq_request({
+            "model": "llama-3.3-70b-versatile",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 300
+        }, timeout=20.0)
+        res.raise_for_status()
+        return res.json()["choices"][0]["message"]["content"].strip()
 
 
 async def _execute_slack(node_data: dict, integrations: dict, context: dict) -> str:
@@ -597,15 +630,15 @@ async def _execute_slack(node_data: dict, integrations: dict, context: dict) -> 
     if not webhook_url:
         raise Exception("Slack not connected. Go to Integrations → Connect Slack.")
 
-    async with httpx.AsyncClient() as client:
-        res = await client.post(webhook_url, json={
-            "text": f"*DevFlow Pipeline* — _{label}_\n{message}",
-            "username": "DevFlow Bot",
-            "icon_emoji": ":zap:"
-        }, timeout=10.0)
-        if res.status_code == 200:
-            return f"Slack message sent: '{label}'"
-        raise Exception(f"Slack webhook failed: {res.status_code}")
+    client = get_http_client()
+    res = await client.post(webhook_url, json={
+        "text": f"*DevFlow Pipeline* — _{label}_\n{message}",
+        "username": "DevFlow Bot",
+        "icon_emoji": ":zap:"
+    }, timeout=10.0)
+    if res.status_code == 200:
+        return f"Slack message sent: '{label}'"
+    raise Exception(f"Slack webhook failed: {res.status_code}")
 
 
 async def _execute_notion(node_data: dict, integrations: dict, context: dict) -> str:
@@ -623,21 +656,21 @@ async def _execute_linear(node_data: dict, integrations: dict, context: dict) ->
     label = node_data.get("label", "Issue")
     description = node_data.get("description", "") or parent_output
 
-    async with httpx.AsyncClient() as client:
-        res = await client.post("https://api.linear.app/graphql",
-            headers={"Authorization": token, "Content-Type": "application/json"},
-            json={"query": """mutation CreateIssue($title: String!, $description: String) {
-                issueCreate(input: {title: $title, description: $description}) {
-                    success issue { id title url }
-                }
-            }""", "variables": {"title": label, "description": description}},
-            timeout=10.0)
-        res.raise_for_status()
-        data = res.json()
-        issue = data.get("data", {}).get("issueCreate", {}).get("issue", {})
-        if issue:
-            return f"Linear issue created: {issue.get('title')} — {issue.get('url', '')}"
-        raise Exception("Linear issue creation failed")
+    client = get_http_client()
+    res = await client.post("https://api.linear.app/graphql",
+        headers={"Authorization": token, "Content-Type": "application/json"},
+        json={"query": """mutation CreateIssue($title: String!, $description: String) {
+            issueCreate(input: {title: $title, description: $description}) {
+                success issue { id title url }
+            }
+        }""", "variables": {"title": label, "description": description}},
+        timeout=10.0)
+    res.raise_for_status()
+    data = res.json()
+    issue = data.get("data", {}).get("issueCreate", {}).get("issue", {})
+    if issue:
+        return f"Linear issue created: {issue.get('title')} — {issue.get('url', '')}"
+    raise Exception("Linear issue creation failed")
 
 
 async def _execute_jira(node_data: dict, integrations: dict, context: dict) -> str:
@@ -650,37 +683,37 @@ async def _execute_jira(node_data: dict, integrations: dict, context: dict) -> s
     label = node_data.get("label", "Issue")
     description = node_data.get("description", "") or "\n".join(context.get("parent_outputs", []))
 
-    async with httpx.AsyncClient() as client:
-        auth = b64.b64encode(f"devflow:{token}".encode()).decode()
-        headers = {"Authorization": f"Basic {auth}", "Content-Type": "application/json"}
+    client = get_http_client()
+    auth = b64.b64encode(f"devflow:{token}".encode()).decode()
+    headers = {"Authorization": f"Basic {auth}", "Content-Type": "application/json"}
 
-        r = await client.get(f"https://{domain}/rest/api/3/project?maxResults=1", headers=headers, timeout=10.0)
-        r.raise_for_status()
-        projects = r.json()
+    r = await client.get(f"https://{domain}/rest/api/3/project?maxResults=1", headers=headers, timeout=10.0)
+    r.raise_for_status()
+    projects = r.json()
 
-        project_list = projects if isinstance(projects, list) else projects.get("values", [])
+    project_list = projects if isinstance(projects, list) else projects.get("values", [])
 
-        if not project_list:
-            raise Exception("No Jira projects found.")
+    if not project_list:
+        raise Exception("No Jira projects found.")
 
-        project_key = project_list[0]["key"]
+    project_key = project_list[0]["key"]
 
-        res = await client.post(f"https://{domain}/rest/api/3/issue", headers=headers,
-            json={"fields": {
-                "project": {"key": project_key},
-                "summary": label,
-                "description": {"type": "doc", "version": 1, "content": [
-                    {"type": "paragraph", "content": [{"type": "text", "text": description or label}]}
-                ]},
-                "issuetype": {"name": "Task"}
-            }}, timeout=10.0)
-        res.raise_for_status()
-        issue = res.json()
+    res = await client.post(f"https://{domain}/rest/api/3/issue", headers=headers,
+        json={"fields": {
+            "project": {"key": project_key},
+            "summary": label,
+            "description": {"type": "doc", "version": 1, "content": [
+                {"type": "paragraph", "content": [{"type": "text", "text": description or label}]}
+            ]},
+            "issuetype": {"name": "Task"}
+        }}, timeout=10.0)
+    res.raise_for_status()
+    issue = res.json()
 
-        return f"Jira issue created: {issue['key']} — https://{domain}/browse/{issue['key']}"
+    return f"Jira issue created: {issue['key']} — https://{domain}/browse/{issue['key']}"
 
 
-# ── Workflow execution ─────────────────────────────────────────────
+# ── Workflow execution (parallel) ──────────────────────────────────
 async def execute_workflow(nodes: list, edges: list, user_id: str, context: dict = {}) -> dict:
     start = datetime.now(timezone.utc)
     logs = []
@@ -688,112 +721,93 @@ async def execute_workflow(nodes: list, edges: list, user_id: str, context: dict
     integrations = await get_user_integrations(user_id)
 
     node_map = {n["id"]: n for n in nodes}
-
-    # Build adjacency list — store full edge objects, not just target ids
     adj: dict[str, list[dict]] = {n["id"]: [] for n in nodes}
     for edge in edges:
-        adj[edge["source"]].append(edge)  # store whole edge
+        adj[edge["source"]].append(edge)
 
     has_incoming = {e["target"] for e in edges}
     roots = [n["id"] for n in nodes if n["id"] not in has_incoming]
     if not roots:
         roots = [nodes[0]["id"]] if nodes else []
 
-    # DFS traversal to get topological execution order
-    visited, stack, seen = [], list(roots), set()
-    while stack:
-        nid = stack.pop()
-        if nid in seen:
-            continue
-        seen.add(nid)
-        visited.append(nid)
-        stack.extend(reversed([e["target"] for e in adj.get(nid, [])]))
+    # Calculate depths for parallel execution
+    depths = {nid: 0 for nid in roots}
+    queue = list(roots)
+    while queue:
+        curr = queue.pop(0)
+        for edge in adj[curr]:
+            target = edge["target"]
+            depths[target] = max(depths.get(target, 0), depths[curr] + 1)
+            if target not in queue:
+                queue.append(target)
+
+    # Group nodes by depth
+    levels = {}
+    for nid, d in depths.items():
+        levels.setdefault(d, []).append(nid)
 
     node_outputs: dict[str, str] = {}
-    skipped_nodes: set[str] = set()  # nodes skipped due to failed condition
+    skipped_nodes: set[str] = set()
 
-    for nid in visited:
-        node = node_map.get(nid)
-        if not node:
-            continue
+    for d in sorted(levels.keys()):
+        level_nodes = levels[d]
+        
+        async def run_node(nid):
+            node = node_map.get(nid)
+            if not node: return
+            
+            node_data = node.get("data", {})
+            node_type = node_data.get("type", node.get("type", "action"))
+            label = node_data.get("label", "Unknown Step")
 
-        node_data = node.get("data", {})
-        node_type = node_data.get("type", node.get("type", "action"))
-        label = node_data.get("label", "Unknown Step")
+            # Check conditions
+            incoming_edges = [e for e in edges if e["target"] == nid]
+            should_skip = False
+            for edge in incoming_edges:
+                if edge["source"] in skipped_nodes:
+                    should_skip = True; break
+                condition = edge.get("condition", "always")
+                if condition and condition != "always":
+                    parent_out = node_outputs.get(edge["source"], "")
+                    if not await _evaluate_condition(condition, parent_out):
+                        should_skip = True; break
+            
+            if should_skip:
+                skipped_nodes.add(nid)
+                logs.append({
+                    "node_id": nid, "node_label": label, "type": node_type,
+                    "status": "skipped", "message": "⏭️ Skipped — condition not met",
+                    "duration": "0.0s", "timestamp": datetime.now(timezone.utc).isoformat()
+                })
+                return
 
-        # ── Check if ALL incoming conditional edges pass ──────────────
-        incoming_edges = [e for e in edges if e["target"] == nid]
-        should_skip = False
+            parent_outputs = [node_outputs[e["source"]] for e in edges if e["target"] == nid and e["source"] in node_outputs]
+            node_context = {**context, "parent_outputs": parent_outputs, "all_node_outputs": node_outputs, "edges": edges, "current_node_id": nid}
+            
+            t_start = datetime.now(timezone.utc)
+            try:
+                result = await _execute_node(node_type, node_data, user_id, integrations, node_context)
+                node_outputs[nid] = result
+                logs.append({
+                    "node_id": nid, "node_label": label, "type": node_type,
+                    "status": "success", "message": result,
+                    "duration": f"{(datetime.now(timezone.utc) - t_start).total_seconds():.1f}s",
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                })
+            except Exception as e:
+                nonlocal status
+                status = "failed"
+                logs.append({
+                    "node_id": nid, "node_label": label, "type": node_type,
+                    "status": "failed", "message": str(e),
+                    "duration": f"{(datetime.now(timezone.utc) - t_start).total_seconds():.1f}s",
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                })
+                return "STOP"
 
-        for edge in incoming_edges:
-            source_id = edge["source"]
-            condition = edge.get("condition", "always")
-
-            # If parent was skipped, skip this node too (cascade)
-            if source_id in skipped_nodes:
-                should_skip = True
-                break
-
-            # If there's a condition, evaluate it against parent output
-            if condition and condition != "always":
-                parent_out = node_outputs.get(source_id, "")
-                if not await _evaluate_condition(condition, parent_out):
-                    should_skip = True
-                    break
-
-        if should_skip:
-            skipped_nodes.add(nid)
-            logs.append({
-                "node_id": nid,
-                "node_label": label,
-                "type": node_type,
-                "status": "skipped",
-                "message": f"⏭️ Skipped — condition not met",
-                "duration": "0.0s",
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            })
-            continue
-
-        # ── Execute node ──────────────────────────────────────────────
-        parent_outputs = [
-            node_outputs[e["source"]]
-            for e in edges
-            if e["target"] == nid and e["source"] in node_outputs
-        ]
-        node_context = {
-            **context,
-            "parent_outputs": parent_outputs,
-            "all_node_outputs": node_outputs,
-            "edges": edges,
-            "current_node_id": nid,
-        }
-
-        t_start = datetime.now(timezone.utc)
-        try:
-            result = await _execute_node(node_type, node_data, user_id, integrations, node_context)
-            node_outputs[nid] = result
-            duration = f"{(datetime.now(timezone.utc) - t_start).total_seconds():.1f}s"
-            logs.append({
-                "node_id": nid,
-                "node_label": label,
-                "type": node_type,
-                "status": "success",
-                "message": result,
-                "duration": duration,
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            })
-        except Exception as e:
-            status = "failed"
-            duration = f"{(datetime.now(timezone.utc) - t_start).total_seconds():.1f}s"
-            logs.append({
-                "node_id": nid,
-                "node_label": label,
-                "type": node_type,
-                "status": "failed",
-                "message": str(e),
-                "duration": duration,
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            })
+        tasks = [run_node(nid) for nid in level_nodes]
+        results = await asyncio.gather(*tasks)
+        if "STOP" in results:
             break
 
     end = datetime.now(timezone.utc)
@@ -801,13 +815,13 @@ async def execute_workflow(nodes: list, edges: list, user_id: str, context: dict
     return {
         "status": status,
         "duration": f"{int(secs // 60)}m {int(secs % 60)}s" if secs >= 60 else f"{secs:.1f}s",
-        "logs": logs,
+        "logs": sorted(logs, key=lambda x: x["timestamp"]),
         "started_at": start.isoformat(),
         "finished_at": end.isoformat()
     }
 
 
-# ── WebSocket-aware executor (optional – include if you use WS) ───────
+# ── WebSocket-aware executor (parallel) ───────────────────────────────
 async def execute_workflow_ws(
     nodes: list,
     edges: list,
@@ -830,116 +844,95 @@ async def execute_workflow_ws(
     if not roots:
         roots = [nodes[0]["id"]] if nodes else []
 
-    visited, stack, seen = [], list(roots), set()
-    while stack:
-        nid = stack.pop()
-        if nid in seen:
-            continue
-        seen.add(nid)
-        visited.append(nid)
-        stack.extend(reversed([e["target"] for e in adj.get(nid, [])]))
+    # Calculate depths
+    depths = {nid: 0 for nid in roots}
+    queue = list(roots)
+    while queue:
+        curr = queue.pop(0)
+        for edge in adj[curr]:
+            target = edge["target"]
+            depths[target] = max(depths.get(target, 0), depths[curr] + 1)
+            if target not in queue:
+                queue.append(target)
+
+    levels = {}
+    for nid, d in depths.items():
+        levels.setdefault(d, []).append(nid)
 
     node_outputs: dict[str, str] = {}
     skipped_nodes: set[str] = set()
 
-    for nid in visited:
-        node = node_map.get(nid)
-        if not node:
-            continue
+    for d in sorted(levels.keys()):
+        level_nodes = levels[d]
+        
+        async def run_node(nid):
+            node = node_map.get(nid)
+            if not node: return
+            
+            node_data = node.get("data", {})
+            node_type = node_data.get("type", node.get("type", "action"))
+            label = node_data.get("label", "Unknown Step")
 
-        node_data = node.get("data", {})
-        node_type = node_data.get("type", node.get("type", "action"))
-        label = node_data.get("label", "Unknown Step")
-
-        if on_node_complete:
-            await on_node_complete({
-                "node_id": nid,
-                "node_label": label,
-                "type": node_type,
-                "status": "running",
-                "message": "Executing...",
-                "duration": None,
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            })
-
-        incoming_edges = [e for e in edges if e["target"] == nid]
-        should_skip = False
-
-        for edge in incoming_edges:
-            source_id = edge["source"]
-            condition = edge.get("condition", "always")
-
-            if source_id in skipped_nodes:
-                should_skip = True
-                break
-
-            if condition and condition != "always":
-                parent_out = node_outputs.get(source_id, "")
-                if not await _evaluate_condition(condition, parent_out):
-                    should_skip = True
-                    break
-
-        if should_skip:
-            skipped_nodes.add(nid)
-            log_entry = {
-                "node_id": nid,
-                "node_label": label,
-                "type": node_type,
-                "status": "skipped",
-                "message": f"⏭️ Skipped — condition not met",
-                "duration": "0.0s",
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            }
-            logs.append(log_entry)
             if on_node_complete:
-                await on_node_complete(log_entry)
-            continue
+                await on_node_complete({
+                    "node_id": nid, "node_label": label, "type": node_type,
+                    "status": "running", "message": "Executing...",
+                    "duration": None, "timestamp": datetime.now(timezone.utc).isoformat()
+                })
 
-        parent_outputs = [
-            node_outputs[e["source"]]
-            for e in edges
-            if e["target"] == nid and e["source"] in node_outputs
-        ]
-        node_context = {
-            **context,
-            "parent_outputs": parent_outputs,
-            "all_node_outputs": node_outputs,
-            "edges": edges,
-            "current_node_id": nid,
-        }
+            incoming_edges = [e for e in edges if e["target"] == nid]
+            should_skip = False
+            for edge in incoming_edges:
+                if edge["source"] in skipped_nodes:
+                    should_skip = True; break
+                condition = edge.get("condition", "always")
+                if condition and condition != "always":
+                    parent_out = node_outputs.get(edge["source"], "")
+                    if not await _evaluate_condition(condition, parent_out):
+                        should_skip = True; break
+            
+            if should_skip:
+                skipped_nodes.add(nid)
+                log_entry = {
+                    "node_id": nid, "node_label": label, "type": node_type,
+                    "status": "skipped", "message": "⏭️ Skipped — condition not met",
+                    "duration": "0.0s", "timestamp": datetime.now(timezone.utc).isoformat()
+                }
+                logs.append(log_entry)
+                if on_node_complete: await on_node_complete(log_entry)
+                return
 
-        t_start = datetime.now(timezone.utc)
-        try:
-            result = await _execute_node(node_type, node_data, user_id, integrations, node_context)
-            node_outputs[nid] = result
-            duration = f"{(datetime.now(timezone.utc) - t_start).total_seconds():.1f}s"
-            log_entry = {
-                "node_id": nid,
-                "node_label": label,
-                "type": node_type,
-                "status": "success",
-                "message": result,
-                "duration": duration,
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            }
-            logs.append(log_entry)
-            if on_node_complete:
-                await on_node_complete(log_entry)
-        except Exception as e:
-            status = "failed"
-            duration = f"{(datetime.now(timezone.utc) - t_start).total_seconds():.1f}s"
-            log_entry = {
-                "node_id": nid,
-                "node_label": label,
-                "type": node_type,
-                "status": "failed",
-                "message": str(e),
-                "duration": duration,
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            }
-            logs.append(log_entry)
-            if on_node_complete:
-                await on_node_complete(log_entry)
+            parent_outputs = [node_outputs[e["source"]] for e in edges if e["target"] == nid and e["source"] in node_outputs]
+            node_context = {**context, "parent_outputs": parent_outputs, "all_node_outputs": node_outputs, "edges": edges, "current_node_id": nid}
+            
+            t_start = datetime.now(timezone.utc)
+            try:
+                result = await _execute_node(node_type, node_data, user_id, integrations, node_context)
+                node_outputs[nid] = result
+                log_entry = {
+                    "node_id": nid, "node_label": label, "type": node_type,
+                    "status": "success", "message": result,
+                    "duration": f"{(datetime.now(timezone.utc) - t_start).total_seconds():.1f}s",
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                }
+                logs.append(log_entry)
+                if on_node_complete: await on_node_complete(log_entry)
+            except Exception as e:
+                nonlocal status
+                status = "failed"
+                log_entry = {
+                    "node_id": nid, "node_label": label, "type": node_type,
+                    "status": "failed", "message": str(e),
+                    "duration": f"{(datetime.now(timezone.utc) - t_start).total_seconds():.1f}s",
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                }
+                logs.append(log_entry)
+                if on_node_complete: await on_node_complete(log_entry)
+                return "STOP"
+
+        tasks = [run_node(nid) for nid in level_nodes]
+        results = await asyncio.gather(*tasks)
+        if "STOP" in results:
             break
 
     end = datetime.now(timezone.utc)
@@ -947,7 +940,7 @@ async def execute_workflow_ws(
     return {
         "status": status,
         "duration": f"{int(secs // 60)}m {int(secs % 60)}s" if secs >= 60 else f"{secs:.1f}s",
-        "logs": logs,
+        "logs": sorted(logs, key=lambda x: x["timestamp"]),
         "started_at": start.isoformat(),
         "finished_at": end.isoformat()
     }

@@ -1,12 +1,25 @@
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from psycopg2.pool import ThreadedConnectionPool
 from app.config import settings
 
-def get_conn():
-    return psycopg2.connect(settings.DATABASE_URL, cursor_factory=RealDictCursor)
+# Global connection pool initialized lazily
+_pool = None
+
+def get_pool():
+    global _pool
+    if _pool is None:
+        _pool = ThreadedConnectionPool(
+            minconn=2,
+            maxconn=15,
+            dsn=settings.DATABASE_URL,
+            cursor_factory=RealDictCursor
+        )
+    return _pool
 
 def query(sql: str, params=None):
-    conn = get_conn()
+    pool = get_pool()
+    conn = pool.getconn()
     try:
         with conn.cursor() as cur:
             cur.execute(sql, params or ())
@@ -14,9 +27,11 @@ def query(sql: str, params=None):
             try:
                 return cur.fetchall()
             except:
+                # Handle cases like INSERT or UPDATE that don't return rows
                 return []
     finally:
-        conn.close()
+        # Always return the connection to the pool
+        pool.putconn(conn)
 
 def query_one(sql: str, params=None):
     result = query(sql, params)
