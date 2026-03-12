@@ -57,6 +57,14 @@ def parse_intent(prompt: str) -> dict:
         intent["action"] = "scan"
     elif any(w in prompt_lower for w in ["refactor", "optimize", "improve", "clean"]):
         intent["action"] = "refactor"
+    if any(word in prompt_lower for word in ["delete", "remove", "drop", "clear"]):
+        action = "delete"
+    elif any(word in prompt_lower for word in ["create", "add", "new", "generate"]):
+        action = "create"
+    elif any(word in prompt_lower for word in ["update", "modify", "rewrite", "refactor", "change", "fix"]):
+        action = "modify"
+    else:
+        action = "modify"
 
     # -- State 2: Determine Target --
     if any(w in prompt_lower for w in ["repo", "repository", "all", "project"]):

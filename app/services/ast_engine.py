@@ -21,6 +21,8 @@ def extract_ast_data(file_path: str, content: str) -> dict:
     ext = "." + file_path.split(".")[-1]
     lang_str = LANGUAGE_MAP.get(ext)
     
+    if not lang_str:
+        return {"file": file_path, "functions": [], "imports": []}
     # Fallback if we don't have a parser for this exact extension
     if not lang_str:
         return {"functions": [], "imports": []}
