@@ -49,13 +49,13 @@ def parse_intent(prompt: str) -> dict:
     }
 
     # -- State 1: Determine Action --
-    if any(w in prompt_lower for w in ["create", "build", "make", "add", "generate"]):
+    if any(word in prompt_lower for word in ["create", "build", "make", "add", "generate"]):
         intent["action"] = "create"
-    elif any(w in prompt_lower for w in ["fix", "resolve", "patch", "repair", "debug"]):
+    elif any(word in prompt_lower for word in ["fix", "resolve", "patch", "repair", "debug"]):
         intent["action"] = "fix"
-    elif any(w in prompt_lower for w in ["scan", "audit", "check", "review", "find"]):
+    elif any(word in prompt_lower for word in ["scan", "audit", "check", "review", "find"]):
         intent["action"] = "scan"
-    elif any(w in prompt_lower for w in ["refactor", "optimize", "improve", "clean"]):
+    elif any(word in prompt_lower for word in ["refactor", "optimize", "improve", "clean"]):
         intent["action"] = "refactor"
     if any(word in prompt_lower for word in ["delete", "remove", "drop", "clear"]):
         action = "delete"
@@ -64,22 +64,33 @@ def parse_intent(prompt: str) -> dict:
     elif any(word in prompt_lower for word in ["update", "modify", "rewrite", "refactor", "change", "fix"]):
         action = "modify"
     else:
-        action = "modify"
+        return {"action": "error", "message": "I couldn't figure out if you want to create, modify, or delete a file. Try using words like 'update' or 'create'."}
 
+    if action == "modify" and repo_files:
+        # Simple heuristic to see if any filename from the repo is in the prompt
+        found_file = any(f.lower() in prompt_lower for f in repo_files)
+        if not found_file:
+            return {
+                "action": "error", 
+                "message": f"I couldn't find the file you mentioned in your repository. Please check the spelling or make sure the file exists!"
+            }
+        
+    return {"action": action, "message": "Intent verified."}
+    
     # -- State 2: Determine Target --
-    if any(w in prompt_lower for w in ["repo", "repository", "all", "project"]):
+    if any(word in prompt_lower for word in ["repo", "repository", "all", "project"]):
         intent["target"] = "repository"
-    elif any(w in prompt_lower for w in ["file", "script", "code", "function"]):
+    elif any(word in prompt_lower for word in ["file", "script", "code", "function"]):
         intent["target"] = "files"
-    elif any(w in prompt_lower for w in ["folder", "directory", "dir"]):
+    elif any(word in prompt_lower for word in ["folder", "directory", "dir"]):
         intent["target"] = "folder"
 
     # -- State 3: Determine Category/Context --
-    if any(w in prompt_lower for w in ["security", "vulnerability", "secret", "leak"]):
+    if any(word in prompt_lower for word in ["security", "vulnerability", "secret", "leak"]):
         intent["category"] = "security"
-    elif any(w in prompt_lower for w in ["performance", "speed", "slow", "lag"]):
+    elif any(word in prompt_lower for word in ["performance", "speed", "slow", "lag"]):
         intent["category"] = "performance"
-    elif any(w in prompt_lower for w in ["auth", "login", "password", "token"]):
+    elif any(word in prompt_lower for word in ["auth", "login", "password", "token"]):
         intent["category"] = "authentication"
     elif any(w in prompt_lower for w in ["ui", "frontend", "css", "design"]):
         intent["category"] = "frontend"
