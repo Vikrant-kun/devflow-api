@@ -1361,39 +1361,41 @@ DESCRIPTION: <2-3 sentence description of changes>"""
         raise Exception(f"PR creation failed: {create_res.json().get('message')}")
     
 async def execute_devflow_phase_one(repo: str, token: str, raw_prompt: str, http_client):
-    # 1. First, fetch the context (The "Pull")
-    # This ensures repo_snapshot is defined and full of files
     try:
+        # 1. Fetch the context
         repo_snapshot = await build_repo_snapshot(repo, token, http_client)
+        
+        # If the snapshot is just a string, it's an error message from GitHub
         if isinstance(repo_snapshot, str):
             return {"status": "failed", "message": f"GitHub Error: {repo_snapshot}"}
+            
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": f"System Error: {str(e)}"}
 
     # 2. Now, sanitize the prompt
     clean_prompt = sanitize_prompt(raw_prompt)
     
-    # 3. Now, parse the intent using the snapshot we just fetched
-    # This is where we pass the file list to verify existence
-    repo_files = [item.get('file') for item in repo_snapshot if 'file' in item]
+    # 3. Safely extract files (only if repo_snapshot is a list of dictionaries)
+    repo_files = []
+    if isinstance(repo_snapshot, list):
+        repo_files = [item.get('file') for item in repo_snapshot if isinstance(item, dict) and 'file' in item]
+    
+    # 4. Parse intent with the verified file list
     intent = parse_intent(clean_prompt, repo_files=repo_files)
 
-    # 4. Check if the parser found an error (like a missing file)
+    # 5. Handle Logic Errors (Missing files, unknown actions)
     if intent.get("action") == "error":
         return {"status": "failed", "message": intent.get("message")}
+    
     if intent.get("action") == "unknown":
         return {"status": "error", "message": "Could not determine action from prompt."}
 
-    # We now have a perfect map of the repository in memory.
-    # We pass this snapshot to Phase 2 (The Brain Index).
-    
     return {
         "status": "success",
         "clean_prompt": clean_prompt,
         "intent": intent,
         "snapshot": repo_snapshot
     }
-
 async def execute_devflow_phase_two(repo_snapshot: dict, file_contents_map: dict):
     # file_contents_map is a dict of {"path/to/file.py": "raw code string..."}
     
