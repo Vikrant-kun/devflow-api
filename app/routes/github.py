@@ -6,6 +6,7 @@ from app.config import settings as app_settings
 from pydantic import BaseModel
 from typing import Optional
 import httpx, base64, secrets, json, time
+import asyncio
 
 router = APIRouter(prefix="/github", tags=["github"])
 
@@ -19,8 +20,11 @@ def get_github_client() -> httpx.AsyncClient:
     global _github_client
     if _github_client is None or _github_client.is_closed:
         _github_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(10.0, connect=5.0),
-            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+            timeout=httpx.Timeout(15.0),
+            limits=httpx.Limits(
+                max_connections=20,
+                max_keepalive_connections=10
+            ),
             headers={"Accept": "application/vnd.github+json"}
         )
     return _github_client
@@ -29,15 +33,27 @@ def get_github_client() -> httpx.AsyncClient:
 # -----------------------------
 # REPO CACHE
 # -----------------------------
-_repo_cache: dict = {}
-REPO_CACHE_TTL = 30
+_repo_cache: dict[str, tuple[float, list]] = {}
+REPO_CACHE_TTL = 60  # seconds
 
+async def github_request(client, method, url, headers=None, **kwargs):
+    res = await client.request(method, url, headers=headers, **kwargs)
 
-def check_rate_limit(res: httpx.Response):
+    # Handle rate limits
     if res.status_code == 403 and "rate limit" in res.text.lower():
-        raise HTTPException(status_code=429, detail="GitHub API rate limit exceeded. Try again later.")
+        reset = res.headers.get("x-ratelimit-reset")
+
+        if reset:
+            wait_time = max(int(reset) - int(time.time()), 1)
+
+            if wait_time < 10:  # only wait if short
+                await asyncio.sleep(wait_time)
+                res = await client.request(method, url, headers=headers, **kwargs)
+
     if res.status_code == 401:
-        raise HTTPException(status_code=401, detail="GitHub token expired or invalid. Please reconnect.")
+        raise HTTPException(status_code=401, detail="GitHub token expired. Please reconnect.")
+
+    return res
 
 
 def get_github_token(user: dict) -> str:
@@ -82,12 +98,12 @@ async def save_settings(body: dict, user: dict = Depends(get_current_user)):
 
         client = get_github_client()
 
-        test = await client.get(
+        test = await github_request(
+            client,
+            "GET",
             "https://api.github.com/user",
             headers={"Authorization": f"Bearer {token}"}
         )
-
-        check_rate_limit(test)
 
         if test.status_code != 200:
             raise HTTPException(status_code=400, detail="Invalid GitHub token")
@@ -153,12 +169,12 @@ async def list_repos(user: dict = Depends(get_current_user)):
     token = get_github_token(user)
     client = get_github_client()
 
-    res = await client.get(
+    res = await github_request(
+        client,
+        "GET",
         "https://api.github.com/user/repos?sort=updated&per_page=100",
         headers={"Authorization": f"Bearer {token}"}
     )
-
-    check_rate_limit(res)
 
     if res.status_code != 200:
         raise HTTPException(status_code=res.status_code, detail=f"GitHub API error: {res.text}")
@@ -189,7 +205,9 @@ async def create_repo(body: CreateRepoRequest, user: dict = Depends(get_current_
     token = get_github_token(user)
     client = get_github_client()
 
-    res = await client.post(
+    res = await github_request(
+        client,
+        "POST",
         "https://api.github.com/user/repos",
         headers={"Authorization": f"Bearer {token}"},
         json={
@@ -199,8 +217,6 @@ async def create_repo(body: CreateRepoRequest, user: dict = Depends(get_current_
             "auto_init": True
         }
     )
-
-    check_rate_limit(res)
 
     if res.status_code not in (200, 201):
         raise HTTPException(status_code=res.status_code, detail=res.json().get("message", "Failed to create repository"))
@@ -230,13 +246,13 @@ async def commit_file(body: CommitFileRequest, user: dict = Depends(get_current_
 
     encoded_content = base64.b64encode(body.content.encode("utf-8")).decode("utf-8")
 
-    check_res = await client.get(
+    check_res = await github_request(
+        client,
+        "GET",
         f"https://api.github.com/repos/{body.repo_full_name}/contents/{body.path}",
         headers={"Authorization": f"Bearer {token}"},
         params={"ref": body.branch}
     )
-
-    check_rate_limit(check_res)
 
     payload = {
         "message": body.message,
@@ -247,13 +263,13 @@ async def commit_file(body: CommitFileRequest, user: dict = Depends(get_current_
     if check_res.status_code == 200:
         payload["sha"] = check_res.json()["sha"]
 
-    put_res = await client.put(
+    put_res = await github_request(
+        client,
+        "PUT",
         f"https://api.github.com/repos/{body.repo_full_name}/contents/{body.path}",
         headers={"Authorization": f"Bearer {token}"},
         json=payload
     )
-
-    check_rate_limit(put_res)
 
     if put_res.status_code not in (200, 201):
         raise HTTPException(status_code=put_res.status_code, detail=put_res.json().get("message", "Failed to commit file"))
@@ -273,12 +289,12 @@ async def delete_repo(owner: str, repo: str, user: dict = Depends(get_current_us
     token = get_github_token(user)
     client = get_github_client()
 
-    res = await client.delete(
+    res = await github_request(
+        client,
+        "DELETE",
         f"https://api.github.com/repos/{owner}/{repo}",
         headers={"Authorization": f"Bearer {token}"}
     )
-
-    check_rate_limit(res)
 
     if res.status_code != 204:
         raise HTTPException(status_code=res.status_code, detail="Failed to delete repository")
@@ -361,12 +377,12 @@ async def get_branches(user: dict = Depends(get_current_user)):
 
     client = get_github_client()
 
-    res = await client.get(
+    res = await github_request(
+        client,
+        "GET",
         f"https://api.github.com/repos/{repo_full_name}/branches",
         headers={"Authorization": f"Bearer {token}"}
     )
-
-    check_rate_limit(res)
 
     if res.status_code != 200:
         raise HTTPException(status_code=res.status_code, detail="Failed to fetch branches")
@@ -401,7 +417,9 @@ async def get_repo_tree(user=Depends(get_current_user)):
     client = get_github_client()
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
     
-    res = await client.get(
+    res = await github_request(
+        client,
+        "GET",
         f"https://api.github.com/repos/{repo}/git/trees/HEAD?recursive=1",
         headers=headers
     )
@@ -425,14 +443,15 @@ async def get_repo_tree(user=Depends(get_current_user)):
 
 @router.post("/disconnect/")
 async def disconnect_github(user=Depends(get_current_user)):
+
     query(
         "UPDATE user_settings SET github_token = NULL WHERE user_id = %s",
         (user["user_id"],)
     )
-    # Clear cache
-    cache_key = f"repo:{user['user_id']}"
-    if cache_key in _cache:
-        del _cache[cache_key]
+
+    # clear repo cache
+    _repo_cache.pop(user["user_id"], None)
+
     return {"success": True}
 
 @router.get("/pulls/")
@@ -447,10 +466,12 @@ async def get_pull_requests(user=Depends(get_current_user)):
     token = settings_row.get("github_token")
     repo = settings_row.get("selected_repo_full_name")
     
-    client = get_http_client()
+    client = get_github_client()
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
     
-    res = await client.get(
+    res = await github_request(
+        client,
+        "GET",
         f"https://api.github.com/repos/{repo}/pulls?state=open",
         headers=headers
     )
@@ -468,10 +489,12 @@ async def create_pull_request(body: dict, user=Depends(get_current_user)):
     token = settings_row.get("github_token")
     repo = settings_row.get("selected_repo_full_name")
     
-    client = get_http_client()
+    client = get_github_client()
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
     
-    res = await client.post(
+    res = await github_request(
+        client,
+        "POST",
         f"https://api.github.com/repos/{repo}/pulls",
         headers=headers,
         json={
@@ -495,10 +518,12 @@ async def merge_pull_request(pr_number: int, user=Depends(get_current_user)):
     token = settings_row.get("github_token")
     repo = settings_row.get("selected_repo_full_name")
     
-    client = get_http_client()
+    client = get_github_client()
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
     
-    res = await client.put(
+    res = await github_request(
+        client,
+        "PUT",
         f"https://api.github.com/repos/{repo}/pulls/{pr_number}/merge",
         headers=headers,
         json={"merge_method": "squash"}
