@@ -1365,6 +1365,8 @@ async def execute_devflow_phase_one(repo: str, token: str, raw_prompt: str, http
     # This ensures repo_snapshot is defined and full of files
     try:
         repo_snapshot = await build_repo_snapshot(repo, token, http_client)
+        if isinstance(repo_snapshot, str):
+            return {"status": "failed", "message": f"GitHub Error: {repo_snapshot}"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
