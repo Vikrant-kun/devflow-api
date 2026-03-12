@@ -62,7 +62,27 @@ async def delete_all_workflows(user: dict = Depends(get_current_user)):
 
 @router.post("/run")
 async def run_workflow(body: RunWorkflowRequest, user: dict = Depends(get_current_user)):
-    prompt_val = getattr(body.snapshot, "prompt", "")
+    raw_prompt = getattr(body.snapshot, "prompt", "")
+    
+    # Phase 1: Clean and Parse (Zero AI Cost)
+    clean_prompt = sanitize_prompt(raw_prompt)
+    intent = parse_intent(clean_prompt)
+    
+    # Fast-Fail Logic: If the FSM has absolutely no idea what to do, reject it.
+    if intent["action"] == "unknown" and intent["target"] == "unknown":
+        return {
+            "status": "failed",
+            "message": "Could not understand the objective. Please specify if you want to fix, scan, or create code.",
+            "logs": []
+        }
+
+    # Pass the clean prompt and intent into the execution context
+    result = await execute_workflow(
+        nodes=body.snapshot.nodes,
+        edges=body.snapshot.edges,
+        user_id=user["user_id"],
+        context={"prompt": clean_prompt, "intent": intent}
+    )
     result = await execute_workflow(
         nodes=body.snapshot.nodes,
         edges=body.snapshot.edges,

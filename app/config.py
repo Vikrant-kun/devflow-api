@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str = ""
     GMAIL_USER: str = ""
     GMAIL_APP_PASSWORD: str = ""
+    OPENROUTER_API_KEY: str = ""
+    POSTHOG_API_KEY: str = ""
 
     class Config:
         env_file = ".env"

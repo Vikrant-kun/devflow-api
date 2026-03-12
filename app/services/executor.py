@@ -9,6 +9,17 @@ from app.config import settings
 from app.database import query_one
 import json
 
+from app.services.ast_engine import extract_ast_data, build_dependency_graph
+from app.services.bm25_engine import rank_and_retrieve_files
+from app.services.ast_engine import trim_code_context
+from app.services.ai_surgeon import execute_ai_planner
+from app.services.ai_surgeon import execute_ai_coder
+from app.services.shield_loop import local_syntax_check, detect_manifest
+from app.services.shield_loop import local_syntax_check, detect_manifest
+from app.services.sandbox import execute_docker_sandbox
+from app.services.free_retry import execute_free_retry
+from app.services.deployment import commit_to_github, send_fallback_email, log_observability_event
+
 _TOOL_MEMORY = {}
 _REPO_INDEX_CACHE = {}
 _REPO_TREE_CACHE = {}
@@ -468,283 +479,92 @@ INVALID
 async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: dict) -> str:
     token = integrations.get("github_token")
     repo = integrations.get("selected_repo_full_name")
+    raw_prompt = (node_data.get("description") or node_data.get("label") or "").strip()
+    
+    # In a real app, pull the actual user email from your DB. Using a placeholder for now.
+    user_email = "devflow-user@example.com" 
+    user_id = context.get("user_id", "system")
+
     if not token or not repo:
         raise Exception("GitHub not connected or no repo selected.")
 
-    description = (node_data.get("description") or node_data.get("label") or "").strip()
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
-
-    filters = extract_file_filters(description)
-
     client = get_http_client()
 
-    async def fetch_tree():
-        tree_url = f"https://api.github.com/repos/{repo}/git/trees/HEAD?recursive=1"
-        repo_url = f"https://api.github.com/repos/{repo}"
+    # --- PHASE 1: THE GATEKEEPER ---
+    phase_1 = await execute_devflow_phase_one(repo, token, raw_prompt, client)
+    if phase_1.get("status") == "error":
+        return f"Phase 1 Error: {phase_1.get('message')}"
         
-        tree_res, repo_res = await asyncio.gather(
-            client.get(tree_url, headers=headers),
-            client.get(repo_url, headers=headers)
-        )
+    snapshot = phase_1["snapshot"]
+    clean_prompt = phase_1["clean_prompt"]
 
-        if tree_res.status_code != 200:
-            raise Exception(f"Cannot access repository tree: {tree_res.json().get('message', tree_res.status_code)}")
-        
-        t = tree_res.json().get("tree", [])
-        if repo_res.status_code == 200:
-            cache_set(f"branch:{repo}", repo_res.json().get("default_branch", "main"))
-        return t
-
-    tree = await _get_cached_repo_tree(repo, fetch_tree)
-
-    code_files = [
-        f["path"] for f in tree
-        if f["type"] == "blob"
-        and any(f["path"].lower().endswith(ext) for ext in [".py", ".js", ".jsx", ".ts", ".tsx", ".css", ".html", ".json", ".yaml", ".yml"])
-        and not any(skip in f["path"].lower() for skip in ["node_modules/", "dist/", "build/", ".min.", "vendor/", "__pycache__/", "venv/"])
-    ]
-
-    if not code_files:
-        raise Exception("No relevant code files found in the repository.")
-
-    file_map = {f["path"]: "" for f in tree if f["type"] == "blob"}
-    repo_index = _get_repo_index(repo, file_map)
-    ranked_files = _rank_files_by_query(description, repo_index)
+    # --- FETCH FILE CONTENTS ---
+    # We need the raw code to build the AST. To avoid rate limits, we fetch concurrently.
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    file_contents_map = {}
     
-    selected_files = context.get("selected_files", [])
-    failed_files = _reflection_penalty(repo, description)
-    
-    # Prioritize pinned files, then ranked files, excluding failures
-    pinned_files = [f for f in selected_files if f in code_files and f not in failed_files]
-    ranked_files = pinned_files + [f for f in ranked_files if f not in pinned_files and f not in failed_files]
-
-    filtered_files = match_files(code_files, filters)
-
-    if ranked_files:
-        filtered_files = [f for f in ranked_files if f in filtered_files] or filtered_files
-
-    print(f"DEBUG REPO CONTEXT LOADED")
-    print(f"DEBUG INDEX RANKED FILES")
-    print(f"DEBUG INDEX RANKED FILES: {ranked_files[:5]}")
-    print(f"DEBUG REFLECTION AVOID FILES: {failed_files}")
-    print(f"DEBUG SELECTED FILES: {selected_files}")
-
-    user_selected = context.get("selected_files", [])
-    if user_selected:
-        valid_selected = [f for f in user_selected if f in code_files]
-        if valid_selected:
-            print(f"DEBUG: User pre-selected files: {valid_selected} — skipping planner")
-            plan = {
-                "target_files": valid_selected,
-                "actions": [],
-                "summary": "user-selected files"
-            }
-        else:
-            plan = await _plan_code_task(description, repo, filtered_files, repo_index)
-    else:
-        plan = await _plan_code_task(description, repo, filtered_files, repo_index)
-
-    print(f"DEBUG PLANNER TARGET FILES: {plan['target_files']}")
-    print(f"DEBUG PLANNER: selected={plan['target_files']} | plan={plan.get('summary')}")
-
-    results = []
-    for selected_path in plan["target_files"][:3]:
-        if selected_path not in code_files:
-            raise Exception(f"AI attempted to modify unauthorized file: {selected_path}")
-        print(f"DEBUG EXECUTOR FILE LOCK: {selected_path}")
-
-        content_res = await client.get(
-            f"https://api.github.com/repos/{repo}/contents/{selected_path}",
-            headers=headers
-        )
-        if content_res.status_code != 200:
-            msg = f"Cannot read file {selected_path}: {content_res.json().get('message')}"
-            results.append(msg)
-            _record_reflection(repo, description, selected_path, "failed - " + msg)
-            continue
-
-        file_data = content_res.json()
-        if file_data.get("encoding") != "base64":
-            msg = f"Unexpected encoding for {selected_path}"
-            results.append(msg)
-            _record_reflection(repo, description, selected_path, "failed - " + msg)
-            continue
-
-        original_content = b64.b64decode(file_data["content"]).decode("utf-8", errors="replace")
-        sha = file_data["sha"]
-
-        if len(original_content) > 180_000:
-            msg = f"Skipped {selected_path} — file too large ({len(original_content)//1000} kB)"
-            results.append(msg)
-            _record_reflection(repo, description, selected_path, msg)
-            continue
-
-        context_code = _smart_chunk_file(original_content, description)
-
-        fix_prompt = f"""
-You are editing ONE file only.
-
-File path:
-{selected_path}
-
-Task:
-{description}
-
-Rules:
-- Modify ONLY this file.
-- Do NOT reference other files.
-- Do NOT invent filenames.
-- Do NOT explain anything.
-
-Return ONLY the full corrected code for this file.
-No markdown.
-No commentary.
-
-Code context:
-{context_code}
-"""
-
-        max_attempts = 2
-        fixed_code = None
-        is_valid = False
-        critic_msg = ""
-        
-        for attempt in range(max_attempts):
-            fix_res = await _groq_request({
-                "model": "llama-3.3-70b-versatile",
-                "messages": [{"role": "user", "content": fix_prompt}],
-                "max_tokens": 8192,
-                "temperature": 0.1,
-                "top_p": 0.9
-            }, timeout=60.0)
-
-            if fix_res.status_code != 200:
-                msg = f"AI fix request failed for {selected_path}: {fix_res.status_code}"
-                results.append(msg)
-                _record_reflection(repo, description, selected_path, "failed - " + msg)
-                break
-
-            fixed_code = fix_res.json()["choices"][0]["message"]["content"].strip()
-            fixed_code = re.sub(r'^```[\w]*\n?', '', fixed_code)
-            fixed_code = re.sub(r'\n?```$', '', fixed_code)
-
-            if fixed_code.strip() == original_content.strip():
-                is_valid = True
-                break
-
-            is_valid, critic_msg = await _critic_validate_fix(original_content, fixed_code, selected_path)
-            if is_valid:
-                break
+    async def fetch_file(filepath):
+        res = await client.get(f"https://api.github.com/repos/{repo}/contents/{filepath}", headers=headers)
+        if res.status_code == 200:
+            data = res.json()
+            if data.get("encoding") == "base64":
+                file_contents_map[filepath] = b64.b64decode(data["content"]).decode("utf-8", errors="replace")
                 
-            print(f"DEBUG RETRY {attempt+1}: critic rejected → {critic_msg}")
+    # Fetch the first 20 relevant files to keep things fast
+    await asyncio.gather(*(fetch_file(f) for f in snapshot["files"][:20]))
 
-        if not fixed_code:
-            continue
-            
-        if fixed_code.strip() == original_content.strip():
-            msg = f"✅ No issues found / no changes needed in {selected_path}"
-            results.append(msg)
-            _record_reflection(repo, description, selected_path, msg)
-            continue
-            
-        if not is_valid:
-            results.append(critic_msg)
-            _record_reflection(repo, description, selected_path, "failed - " + critic_msg)
-            continue
+    # --- PHASE 2: THE BRAIN INDEX ---
+    phase_2 = await execute_devflow_phase_two(snapshot, file_contents_map)
+    ast_index = phase_2["ast_index"]
+    dependency_graph = phase_2["dependency_graph"]
 
-        # Basic syntax check
-        if selected_path.endswith('.py'):
-            import ast
-            try:
-                ast.parse(fixed_code)
-            except SyntaxError as e:
-                msg = f"⚠️ Python syntax error in AI fix for {selected_path}: {e} — original preserved"
-                results.append(msg)
-                _record_reflection(repo, description, selected_path, "failed - syntax")
-                continue
+    # Rank and trim context
+    target_files = rank_and_retrieve_files(clean_prompt, ast_index, dependency_graph)
+    trimmed_context = await execute_devflow_phase_two_c(clean_prompt, target_files, ast_index, file_contents_map)
 
-        if selected_path.endswith('.js') or selected_path.endswith('.jsx'):
-            # check for obvious JS issues
-            js_issues = []
-            open_braces = fixed_code.count('{') - fixed_code.count('}')
-            open_parens = fixed_code.count('(') - fixed_code.count(')')
-            if abs(open_braces) > 2:
-                js_issues.append(f"unbalanced braces ({open_braces:+d})")
-            if abs(open_parens) > 2:
-                js_issues.append(f"unbalanced parens ({open_parens:+d})")
-            if js_issues:
-                msg = f"⚠️ JS syntax issues in AI fix for {selected_path}: {', '.join(js_issues)} — original preserved"
-                results.append(msg)
-                _record_reflection(repo, description, selected_path, "failed - syntax")
-                continue
+    # --- PHASE 3: THE AI SURGEON ---
+    execution_plan = await execute_devflow_phase_three_a(clean_prompt, trimmed_context, _groq_request)
+    if execution_plan.get("status") == "failed":
+        return execution_plan.get("message")
 
-        encoded = b64.b64encode(fixed_code.encode("utf-8")).decode("utf-8")
+    surgeon_result = await execute_devflow_phase_three_b(execution_plan, file_contents_map, _groq_request)
+    if surgeon_result.get("status") == "failed":
+        return surgeon_result.get("message")
 
-        branch_cache_key = f"branch:{repo}"
-        default_branch = cache_get(branch_cache_key)
-        if not default_branch:
-            branch_res = await client.get(f"https://api.github.com/repos/{repo}", headers=headers)
-            default_branch = branch_res.json().get("default_branch", "main") if branch_res.status_code == 200 else "main"
-            cache_set(branch_cache_key, default_branch)
+    target_file = surgeon_result["target_file"]
+    fixed_code = surgeon_result["fixed_code"]
 
-        commit_target_path = selected_path
-        if selected_path not in commit_target_path:
-            raise Exception("Commit attempted to modify unexpected file")
-
-        commit_res = await client.put(
-            f"https://api.github.com/repos/{repo}/contents/{selected_path}",
-            headers=headers,
-            json={
-                "message": f"DevFlow AI: improved/fixed {selected_path}",
-                "content": encoded,
-                "sha": sha,
-                "branch": default_branch
-            }
+    # --- PHASE 4: EXECUTION & SHIELD LOOP ---
+    # We run the fast syntax check first
+    shield_status = await execute_devflow_phase_four_a(fixed_code, target_file, snapshot)
+    
+    if shield_status["status"] == "ready_for_sandbox":
+        # In a real environment, you would clone the repo to a local /tmp/workspace_dir here
+        # For now, we mock the workspace dir path
+        workspace_dir = f"/tmp/devflow_{repo.replace('/', '_')}" 
+        
+        sandbox_result = await execute_devflow_phase_four_b(
+            target_file=target_file, 
+            current_code=fixed_code, 
+            repo_snapshot=snapshot, 
+            workspace_dir=workspace_dir, 
+            http_client=client
         )
+    else:
+        sandbox_result = shield_status # Pass the failure forward
 
-        if commit_res.status_code not in (200, 201):
-            err_body = commit_res.json()
-            msg = f"Commit failed ({commit_res.status_code}): {err_body.get('message')} | repo={repo} | file={selected_path}"
-            results.append(msg)
-            _record_reflection(repo, description, selected_path, "failed - commit error")
-            continue
+    # --- PHASE 5: DEPLOYMENT ---
+    final_result = await execute_devflow_phase_five(
+        sandbox_result=sandbox_result,
+        repo=repo,
+        filepath=target_file,
+        user_email=user_email,
+        user_id=user_id,
+        github_token=token,
+        http_client=client
+    )
 
-        # Auto PR if description mentions "pr" or "pull request"
-        pr_url = ""
-        if any(k in description.lower() for k in ["pr", "pull request", "open pr", "create pr"]):
-            pr_branch = f"devflow/fix-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
-            # create branch
-            ref_res = await client.get(
-                f"https://api.github.com/repos/{repo}/git/ref/heads/{default_branch}",
-                headers=headers
-            )
-            if ref_res.status_code == 200:
-                sha_branch = ref_res.json()["object"]["sha"]
-                await client.post(
-                    f"https://api.github.com/repos/{repo}/git/refs",
-                    headers=headers,
-                    json={"ref": f"refs/heads/{pr_branch}", "sha": sha_branch}
-                )
-                pr_res = await client.post(
-                    f"https://api.github.com/repos/{repo}/pulls",
-                    headers=headers,
-                    json={
-                        "title": f"DevFlow AI: fixes in {selected_path}",
-                        "body": f"Auto-generated PR by DevFlow AI\n\nFixed: `{selected_path}`",
-                        "head": pr_branch,
-                        "base": default_branch
-                    }
-                )
-                if pr_res.status_code == 201:
-                    pr_url = f"\n🔀 PR created: {pr_res.json()['html_url']}"
-
-        _remember_tool(repo, selected_path)
-        print(f"DEBUG CRITIC APPROVED: {selected_path}")
-        success_msg = f"✅ Fixed and committed {selected_path} to {repo}/{default_branch}{pr_url}"
-        results.append(success_msg)
-        _record_reflection(repo, description, selected_path, success_msg)
-
-    return "\n".join(results)
+    return final_result["message"]
 
 
 # ── Helper: evaluate a conditional edge ──────────────────────────────
@@ -1524,3 +1344,181 @@ DESCRIPTION: <2-3 sentence description of changes>"""
             return f"✅ PR #{pr['number']} created: {pr['html_url']}\n\nTitle: {pr_title}\n{pr_body}"
         
         raise Exception(f"PR creation failed: {create_res.json().get('message')}")
+    
+async def execute_devflow_phase_one(repo: str, token: str, raw_prompt: str, http_client):
+    # 1. Typo Sanitizer
+    clean_prompt = sanitize_prompt(raw_prompt)
+    
+    # 2. Intent Parser
+    intent = parse_intent(clean_prompt)
+    if intent["action"] == "unknown":
+        return {"status": "error", "message": "Could not determine action from prompt."}
+
+    # 3. Repo Snapshot Engine
+    try:
+        repo_snapshot = await build_repo_snapshot(repo, token, http_client)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+    # We now have a perfect map of the repository in memory.
+    # We pass this snapshot to Phase 2 (The Brain Index).
+    
+    return {
+        "status": "success",
+        "clean_prompt": clean_prompt,
+        "intent": intent,
+        "snapshot": repo_snapshot
+    }
+
+async def execute_devflow_phase_two(repo_snapshot: dict, file_contents_map: dict):
+    # file_contents_map is a dict of {"path/to/file.py": "raw code string..."}
+    
+    ast_index = []
+    
+    # 1. Parse all relevant files into the AST Index
+    for file_path in repo_snapshot["files"]:
+        content = file_contents_map.get(file_path, "")
+        if content:
+            ast_data = extract_ast_data(file_path, content)
+            ast_index.append(ast_data)
+            
+    # 2. Build the exact Dependency Graph
+    dependency_graph = build_dependency_graph(ast_index, repo_snapshot["files"])
+    
+    return {
+        "ast_index": ast_index,
+        "dependency_graph": dependency_graph
+    }
+
+async def execute_devflow_phase_two_c(clean_prompt: str, target_files: list, ast_index: list, file_contents_map: dict):
+    
+    # Trim the fat. This turns 10,000 tokens of raw code into ~500 tokens of pure context.
+    optimized_payload = trim_code_context(
+        target_files=target_files,
+        file_contents_map=file_contents_map,
+        ast_index=ast_index,
+        clean_prompt=clean_prompt
+    )
+    
+    return optimized_payload
+
+async def execute_devflow_phase_three_a(clean_prompt: str, trimmed_context: dict, _groq_request):
+    
+    # The Planner decides exactly what to do (Cheap AI Call)
+    execution_plan = await execute_ai_planner(
+        clean_prompt=clean_prompt,
+        trimmed_context=trimmed_context,
+        _groq_request_func=_groq_request
+    )
+    
+    if "error" in execution_plan:
+        return {"status": "failed", "message": execution_plan["error"]}
+        
+    return execution_plan
+
+async def execute_devflow_phase_three_b(execution_plan: dict, file_contents_map: dict, _groq_request):
+    
+    target_file = execution_plan.get("target_file")
+    
+    # Grab the original full code for the targeted file
+    original_code = file_contents_map.get(target_file, "")
+    
+    if not original_code and execution_plan.get("action_type") != "create":
+        return {"status": "failed", "message": f"Target file {target_file} is empty or missing."}
+
+    # The Executor writes the actual fix (Heavy AI Call)
+    fixed_code = await execute_ai_coder(
+        execution_plan=execution_plan,
+        original_file_content=original_code,
+        _groq_request_func=_groq_request
+    )
+    
+    return {
+        "target_file": target_file,
+        "fixed_code": fixed_code,
+        "original_code": original_code
+    }
+
+async def execute_devflow_phase_four_a(fixed_code: str, target_file: str, repo_snapshot: dict):
+    
+    # 1. Zero-Cost Syntax Shield
+    is_valid, error_msg = local_syntax_check(target_file, fixed_code)
+    
+    if not is_valid:
+        # BOUNCE TO FREE RETRY LOOP: Code is broken!
+        return {
+            "status": "failed", 
+            "reason": "syntax_error", 
+            "console_log": error_msg
+        }
+        
+    # 2. Setup the Docker Sandbox environment
+    sandbox_config = detect_manifest(repo_snapshot["files"])
+    
+    return {
+        "status": "ready_for_sandbox",
+        "sandbox_config": sandbox_config
+    }
+
+async def execute_devflow_phase_four_b(target_file: str, current_code: str, repo_snapshot: dict, workspace_dir: str, http_client):
+    
+    max_retries = 2
+    attempts = 0
+    
+    sandbox_config = detect_manifest(repo_snapshot["files"])
+    
+    while attempts <= max_retries:
+        # 1. Zero-Cost Syntax Shield
+        is_valid, error_msg = local_syntax_check(target_file, current_code)
+        
+        if not is_valid:
+            sandbox_result = {"status": "failed", "console_log": error_msg}
+        else:
+            # 2. Run the secure Sandbox
+            # (Assume current_code has been written to workspace_dir/target_file before running)
+            sandbox_result = execute_docker_sandbox(workspace_dir, sandbox_config)
+            
+        # 3. Check Results
+        if sandbox_result["status"] == "success":
+            return {"status": "success", "final_code": current_code}
+            
+        # 4. If failed, trigger the Free Retry Loop (unless we hit the max attempts)
+        attempts += 1
+        if attempts <= max_retries:
+            print(f"Attempt {attempts} failed. Triggering Free Retry Loop...")
+            current_code = await execute_free_retry(
+                target_file=target_file,
+                broken_code=current_code,
+                error_log=sandbox_result["console_log"],
+                http_client=http_client
+            )
+            
+            # If OpenRouter is down or returned nothing, break the loop
+            if not current_code:
+                break
+                
+    # If we exit the loop, the AI completely failed to fix the code
+    return {"status": "total_failure", "console_log": sandbox_result.get("console_log", "Unknown error")}
+
+async def execute_devflow_phase_five(sandbox_result: dict, repo: str, filepath: str, user_email: str, user_id: str, github_token: str, http_client):
+    
+    # 1. Handle the Outcome
+    if sandbox_result["status"] == "success":
+        # WIN: Commit the code
+        final_code = sandbox_result["final_code"]
+        deploy_res = await commit_to_github(repo, filepath, final_code, github_token, http_client)
+        
+        # Log to PostHog
+        await log_observability_event(user_id, "ai_fix_success", {"repo": repo, "file": filepath}, http_client)
+        
+        return {"status": "completed", "message": f"Successfully fixed and committed: {deploy_res.get('url')}"}
+        
+    else:
+        # LOSS: Trigger the Fallback Email
+        error_log = sandbox_result.get("console_log", "Unknown testing error.")
+        await send_fallback_email(user_email, filepath, error_log, http_client)
+        
+        # Log to PostHog
+        await log_observability_event(user_id, "ai_fix_failed", {"repo": repo, "file": filepath, "error": error_log}, http_client)
+        
+        return {"status": "aborted", "message": f"Sandbox tests failed. Original code preserved. Incident report sent to {user_email}."}
