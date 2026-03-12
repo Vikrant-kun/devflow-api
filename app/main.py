@@ -19,7 +19,7 @@ app.add_middleware(
         "http://localhost:5174",
         "http://localhost:3000",
         "http://localhost:4173",
-        "https://dev-flow-ai-wheat.vercel.app"
+        "https://dev-flow-ai-wheat.vercel.app",
         "https://devflow-api-production.up.railway.app",
     ],
     allow_credentials=True,
