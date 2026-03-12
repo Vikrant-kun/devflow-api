@@ -571,36 +571,38 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
 
 # ── Helper: evaluate a conditional edge ──────────────────────────────
 async def _evaluate_condition(condition: str, parent_output: str) -> bool:
-    """Use AI to evaluate if a condition passes based on parent output."""
+    """Uses AI to evaluate if a condition passes, prioritizing success markers."""
     if not condition or condition in ("always", ""):
-        return True
+        return True # 
+
+    # Pre-check for definitive success markers to avoid AI hallucination
+    if "✅ Fixed and committed" in parent_output or "Successfully fixed" in parent_output:
+        if condition == "no_errors": return True # 
+        if condition == "errors_found": return False # 
 
     prompt = f"""You are a workflow condition evaluator.
+    Parent node output: "{parent_output}"
+    Edge condition: "{condition}"
 
-Parent node output:
-"{parent_output}"
+    Rules:
+    - If the output contains "✅ Fixed and committed", the task SUCCEEDED.
+    - If it contains "Phase 1 Error" but ALSO a success URL, ignore the error.
+    - "no_errors" = The code is now clean and pushed.
+    - "errors_found" = The system completely failed to push code.
 
-Edge condition to evaluate:
-"{condition}"
-
-Important context:
-- "✅ Fixed and committed" means errors WERE found and fixed → errors exist
-- "✅ No issues found" means code was clean → no errors
-- "no changes needed" means code was clean → no errors
-
-Does the parent output satisfy this condition?
-Reply with ONLY: true or false"""
+    Reply ONLY: true or false""" # 
 
     res = await _groq_request({
         "model": "llama-3.3-70b-versatile",
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 5,
         "temperature": 0
-    }, timeout=10.0)
+    }, timeout=10.0) # 
+
     if res.status_code == 200:
         answer = res.json()["choices"][0]["message"]["content"].strip().lower()
-        return answer == "true"
-    return True  # safe fallback
+        return answer == "true" # 
+    return True
 
 
 # ── Helper: Get all ancestor outputs ─────────────────────────────────────────
