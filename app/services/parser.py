@@ -36,7 +36,10 @@ def sanitize_prompt(prompt: str) -> str:
             
     return " ".join(sanitized_words)
 
-def parse_intent(prompt: str) -> dict:
+def parse_intent(clean_prompt: str, repo_files=None) -> dict:
+    # Ensure repo_files is at least an empty list if nothing is passed
+    if repo_files is None:
+        repo_files = []
     """
     Step 3: FSM Intent Parser.
     Deterministically categorizes the prompt into actionable states.
@@ -76,7 +79,7 @@ def parse_intent(prompt: str) -> dict:
             }
         
     return {"action": action, "message": "Intent verified."}
-    
+
     # -- State 2: Determine Target --
     if any(word in prompt_lower for word in ["repo", "repository", "all", "project"]):
         intent["target"] = "repository"

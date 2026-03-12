@@ -1365,7 +1365,8 @@ async def execute_devflow_phase_one(repo: str, token: str, raw_prompt: str, http
     clean_prompt = sanitize_prompt(raw_prompt)
     
     # 2. Intent Parser
-    intent = parse_intent(clean_prompt)
+    repo_files = [item.get('file') for item in repo_snapshot if 'file' in item]
+    intent = parse_intent(clean_prompt, repo_files=repo_files)
     if intent["action"] == "unknown":
         return {"status": "error", "message": "Could not determine action from prompt."}
 
