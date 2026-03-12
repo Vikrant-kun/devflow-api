@@ -1513,7 +1513,7 @@ async def execute_devflow_phase_five(sandbox_result: dict, repo: str, filepath: 
         # Log to PostHog
         await log_observability_event(user_id, "ai_fix_success", {"repo": repo, "file": filepath}, http_client)
         
-        return {"status": "completed", "message": f"Successfully fixed and committed: {deploy_res.get('url')}"}
+        return {"status": "completed", "message": f"✅ Fixed and committed {filepath} to {repo}\n{deploy_res.get('url')}"}
         
     else:
         # LOSS: Trigger the Fallback Email
