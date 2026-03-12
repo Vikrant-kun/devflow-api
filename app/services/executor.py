@@ -1309,6 +1309,17 @@ End with either APPROVE or REQUEST_CHANGES."""
             json={"ref": f"refs/heads/{pr_branch}", "sha": head_sha}
         )
 
+        import base64 as b64
+        await client.put(
+            f"https://api.github.com/repos/{repo}/contents/devflow-pr-update.md",
+            headers=headers,
+            json={
+                "message": "DevFlow AI: Initialize PR branch",
+                "content": b64.b64encode(b"Automated PR placeholder.").decode(),
+                "branch": pr_branch
+            }
+        )
+
         # AI generates PR title and description
         pr_prompt = f"""Generate a pull request title and description based on this context:
 {parent_output or description or 'Code improvements by DevFlow AI'}
