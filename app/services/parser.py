@@ -37,48 +37,44 @@ def sanitize_prompt(prompt: str) -> str:
     return " ".join(sanitized_words)
 
 def parse_intent(clean_prompt: str, repo_files=None) -> dict:
-    # Ensure repo_files is at least an empty list if nothing is passed
     if repo_files is None:
         repo_files = []
+        
     """
     Step 3: FSM Intent Parser.
-    Deterministically categorizes the prompt into actionable states.
+    Deterministically categorizes the prompt into actionable states and verifies files.
     """
-    prompt_lower = prompt.lower()
+    # 1. FIX: Use the correct variable name
+    prompt_lower = clean_prompt.lower()
+    
     intent = {
-        "action": "unknown",   # fix, scan, create, refactor
-        "target": "unknown",   # repository, files, folder
-        "category": "general"  # security, performance, auth, logic
+        "action": "unknown",
+        "target": "unknown",
+        "category": "general",
+        "message": "Intent verified."
     }
 
     # -- State 1: Determine Action --
-    if any(word in prompt_lower for word in ["create", "build", "make", "add", "generate"]):
+    if any(word in prompt_lower for word in ["delete", "remove", "drop", "clear"]):
+        intent["action"] = "delete"
+    elif any(word in prompt_lower for word in ["create", "build", "make", "add", "generate", "new"]):
         intent["action"] = "create"
-    elif any(word in prompt_lower for word in ["fix", "resolve", "patch", "repair", "debug"]):
-        intent["action"] = "fix"
+    elif any(word in prompt_lower for word in ["update", "modify", "rewrite", "refactor", "change", "fix", "resolve", "patch", "repair", "debug"]):
+        intent["action"] = "modify"
     elif any(word in prompt_lower for word in ["scan", "audit", "check", "review", "find"]):
         intent["action"] = "scan"
-    elif any(word in prompt_lower for word in ["refactor", "optimize", "improve", "clean"]):
-        intent["action"] = "refactor"
-    if any(word in prompt_lower for word in ["delete", "remove", "drop", "clear"]):
-        action = "delete"
-    elif any(word in prompt_lower for word in ["create", "add", "new", "generate"]):
-        action = "create"
-    elif any(word in prompt_lower for word in ["update", "modify", "rewrite", "refactor", "change", "fix"]):
-        action = "modify"
     else:
-        return {"action": "error", "message": "I couldn't figure out if you want to create, modify, or delete a file. Try using words like 'update' or 'create'."}
+        return {"action": "error", "message": "I couldn't figure out if you want to create, modify, scan, or delete a file. Try using explicit words like 'update' or 'create'."}
 
-    if action == "modify" and repo_files:
-        # Simple heuristic to see if any filename from the repo is in the prompt
+    # -- Wallet Protection: Check File Existence --
+    if intent["action"] == "modify" and repo_files:
+        # Simple heuristic: see if any filename from the repo is in the prompt
         found_file = any(f.lower() in prompt_lower for f in repo_files)
         if not found_file:
             return {
                 "action": "error", 
-                "message": f"I couldn't find the file you mentioned in your repository. Please check the spelling or make sure the file exists!"
+                "message": "I couldn't find the file you mentioned in your repository. Please check the spelling or make sure the file exists!"
             }
-        
-    return {"action": action, "message": "Intent verified."}
 
     # -- State 2: Determine Target --
     if any(word in prompt_lower for word in ["repo", "repository", "all", "project"]):
