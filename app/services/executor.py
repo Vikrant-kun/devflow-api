@@ -1361,20 +1361,26 @@ DESCRIPTION: <2-3 sentence description of changes>"""
         raise Exception(f"PR creation failed: {create_res.json().get('message')}")
     
 async def execute_devflow_phase_one(repo: str, token: str, raw_prompt: str, http_client):
-    # 1. Typo Sanitizer
-    clean_prompt = sanitize_prompt(raw_prompt)
-    
-    # 2. Intent Parser
-    repo_files = [item.get('file') for item in repo_snapshot if 'file' in item]
-    intent = parse_intent(clean_prompt, repo_files=repo_files)
-    if intent["action"] == "unknown":
-        return {"status": "error", "message": "Could not determine action from prompt."}
-
-    # 3. Repo Snapshot Engine
+    # 1. First, fetch the context (The "Pull")
+    # This ensures repo_snapshot is defined and full of files
     try:
         repo_snapshot = await build_repo_snapshot(repo, token, http_client)
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+    # 2. Now, sanitize the prompt
+    clean_prompt = sanitize_prompt(raw_prompt)
+    
+    # 3. Now, parse the intent using the snapshot we just fetched
+    # This is where we pass the file list to verify existence
+    repo_files = [item.get('file') for item in repo_snapshot if 'file' in item]
+    intent = parse_intent(clean_prompt, repo_files=repo_files)
+
+    # 4. Check if the parser found an error (like a missing file)
+    if intent.get("action") == "error":
+        return {"status": "failed", "message": intent.get("message")}
+    if intent.get("action") == "unknown":
+        return {"status": "error", "message": "Could not determine action from prompt."}
 
     # We now have a perfect map of the repository in memory.
     # We pass this snapshot to Phase 2 (The Brain Index).
