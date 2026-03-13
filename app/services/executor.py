@@ -529,7 +529,11 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
                 file_contents_map[filepath] = b64.b64decode(data["content"]).decode("utf-8", errors="replace")
                 
     # Fetch the first 20 relevant files to keep things fast
-    await asyncio.gather(*(fetch_file(f) for f in snapshot["files"][:20]))
+    files_to_fetch = set(snapshot["files"][:20])
+    if forced_file:
+        files_to_fetch.add(forced_file)
+
+    await asyncio.gather(*(fetch_file(f) for f in files_to_fetch))
 
     # --- PHASE 2: THE BRAIN INDEX ---
     phase_2 = await execute_devflow_phase_two(snapshot, file_contents_map)
@@ -671,6 +675,7 @@ Rules (in strict priority order):
 - If it explicitly mentions Linear → return: linear
 - If it explicitly mentions Jira → return: jira
 - If it is a general AI task → return: ai
+- If the phrase contains "fix", "update", "check file", "scan file", "edit code" → ALWAYS return: ai_code_edit
 
 IMPORTANT:
 - "notify", "alert", "notification" WITHOUT mentioning Slack/Notion/Jira = email
@@ -1416,7 +1421,10 @@ async def execute_devflow_phase_one(repo: str, token: str, raw_prompt: str, http
 
     file_match = re.findall(r'[\w\/\.-]+\.[a-zA-Z]+', clean_prompt)
 
-    missing_files = [f for f in file_match if f not in repo_files]
+    missing_files = [
+        f for f in file_match
+        if not any(r.endswith(f.split("/")[-1]) for r in repo_files)
+    ]
 
     if missing_files:
         return {
@@ -1493,7 +1501,7 @@ async def execute_devflow_phase_three_a(clean_prompt: str, trimmed_context: dict
 
 async def execute_devflow_phase_three_b(execution_plan: dict, file_contents_map: dict, _groq_request):
     
-    target_file = forced_file if forced_file else execution_plan.get("target_file")
+    target_file = execution_plan.get("target_file")
     
     # Grab the original full code for the targeted file
     original_code = file_contents_map.get(target_file, "")

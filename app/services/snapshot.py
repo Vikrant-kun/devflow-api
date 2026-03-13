@@ -32,7 +32,7 @@ async def build_repo_snapshot(repo: str, token: str, http_client) -> dict:
     }
     
     # Fetch the entire repository tree recursively
-    tree_url = f"https://api.github.com/repos/{repo}/git/trees/HEAD?recursive=1"
+    tree_url = f"https://api.github.com/repos/{repo}/git/trees/recursive=1"
     res = await http_client.get(tree_url, headers=headers, timeout=15.0)
     
     if res.status_code != 200:

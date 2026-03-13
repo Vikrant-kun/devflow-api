@@ -61,7 +61,7 @@ def parse_intent(clean_prompt: str, repo_files=None) -> dict:
         intent["action"] = "create"
     elif any(word in prompt_lower for word in ["update", "modify", "rewrite", "refactor", "change", "fix", "resolve", "patch", "repair", "debug"]):
         intent["action"] = "modify"
-    elif any(word in prompt_lower for word in ["scan", "audit", "check", "review", "find"]):
+    elif any(word in prompt_lower for word in ["update","modify","rewrite","fix","resolve","patch","repair","debug"]):
         intent["action"] = "scan"
     else:
         return {"action": "error", "message": "I couldn't figure out if you want to create, modify, scan, or delete a file. Try using explicit words like 'update' or 'create'."}
@@ -69,7 +69,10 @@ def parse_intent(clean_prompt: str, repo_files=None) -> dict:
     # -- Wallet Protection: Check File Existence --
     if intent["action"] == "modify" and repo_files:
         # Simple heuristic: see if any filename from the repo is in the prompt
-        found_file = any(f.lower() in prompt_lower for f in repo_files)
+        found_file = any(
+             f.split("/")[-1].lower() in prompt_lower
+             for f in repo_files
+        )
         if not found_file:
             return {
                 "action": "error", 
