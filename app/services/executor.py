@@ -482,15 +482,18 @@ INVALID
 
 # ── AI Code Edit executor ────────────────────────────────────────────────────
 async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: dict) -> str:
-    selected_files = node_data.get("selected_files", [])
-    forced_file = selected_files[0]["path"] if selected_files else None
+    selected_files = context.get("selected_files") or node_data.get("selected_files") or []
+
+    forced_file = None
+    if selected_files:
+        first = selected_files[0]
+        if isinstance(first, dict):
+            forced_file = first.get("path")
+        else:
+            forced_file = first
     token = integrations.get("github_token")
     repo = integrations.get("selected_repo_full_name")
     raw_prompt = (node_data.get("description") or node_data.get("label") or "").strip()
-    selected_files = node_data.get("selected_files", [])
-    forced_file = None
-    if selected_files:
-        forced_file = selected_files[0]["path"]
 
  # In a real app, pull the actual user email from your DB. Using a placeholder for now.
     user_email = "devflow-user@example.com" 
@@ -509,6 +512,8 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
         return f"Phase 1 Error: {phase_1.get('message')}"
         
     snapshot = phase_1["snapshot"]
+    if forced_file and forced_file not in snapshot["files"]:
+        return f"❌ Selected file not found in repository: {forced_file}"
     clean_prompt = phase_1["clean_prompt"]
 
     # --- FETCH FILE CONTENTS ---
@@ -1052,7 +1057,7 @@ async def execute_workflow(nodes: list, edges: list, user_id: str, context: dict
                 return
 
             parent_outputs = [node_outputs[e["source"]] for e in edges if e["target"] == nid and e["source"] in node_outputs]
-            node_context = {**context, "parent_outputs": parent_outputs, "all_node_outputs": node_outputs, "edges": edges, "current_node_id": nid}
+            node_context = {**context, "parent_outputs": parent_outputs, "all_node_outputs": node_outputs, "edges": edges, "current_node_id": nid, "snapshot": context.get("snapshot")}
             
             t_start = datetime.now(timezone.utc)
             try:
@@ -1173,7 +1178,7 @@ async def execute_workflow_ws(
                 return
 
             parent_outputs = [node_outputs[e["source"]] for e in edges if e["target"] == nid and e["source"] in node_outputs]
-            node_context = {**context, "parent_outputs": parent_outputs, "all_node_outputs": node_outputs, "edges": edges, "current_node_id": nid}
+            node_context = {**context, "parent_outputs": parent_outputs, "all_node_outputs": node_outputs, "edges": edges, "current_node_id": nid, "snapshot": context.get("snapshot")}
             
             t_start = datetime.now(timezone.utc)
             try:
@@ -1488,7 +1493,7 @@ async def execute_devflow_phase_three_a(clean_prompt: str, trimmed_context: dict
 
 async def execute_devflow_phase_three_b(execution_plan: dict, file_contents_map: dict, _groq_request):
     
-    target_file = execution_plan.get("target_file")
+    target_file = forced_file if forced_file else execution_plan.get("target_file")
     
     # Grab the original full code for the targeted file
     original_code = file_contents_map.get(target_file, "")
