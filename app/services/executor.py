@@ -995,6 +995,7 @@ async def _execute_jira(node_data: dict, integrations: dict, context: dict) -> s
 
 # ── Workflow execution (parallel) ──────────────────────────────────
 async def execute_workflow(nodes: list, edges: list, user_id: str, context: dict = {}) -> dict:
+    _TOOL_MEMORY.clear()
     start = datetime.now(timezone.utc)
     logs = []
     status = "success"
@@ -1109,6 +1110,7 @@ async def execute_workflow_ws(
     context: dict = {},
     on_node_complete=None
 ) -> dict:
+    _TOOL_MEMORY.clear()
     start = datetime.now(timezone.utc)
     logs = []
     status = "success"
