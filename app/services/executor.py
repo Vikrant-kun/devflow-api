@@ -713,7 +713,16 @@ async def _execute_node(node_type: str, node_data: dict, user_id: str, integrati
         elif intent == "ai_code_edit":
             return await _execute_ai_code_edit(node_data, integrations, context)
         elif intent == "github":
+            token = integrations.get("github_token")
+            repo = integrations.get("selected_repo_full_name")
+            client = get_http_client()
+
+            phase_1 = await execute_devflow_phase_one(repo, token, description, client)
+            if phase_1.get("status") == "failed":
+                return phase_1.get("message")
+        
             return await _execute_github(node_data, integrations, context)
+        
         elif intent == "slack":
             return await _execute_slack(node_data, integrations, context)
         elif intent == "notion":
