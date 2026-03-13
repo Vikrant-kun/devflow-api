@@ -718,8 +718,8 @@ async def _execute_node(node_type: str, node_data: dict, user_id: str, integrati
             client = get_http_client()
 
             phase_1 = await execute_devflow_phase_one(repo, token, description, client)
-            if phase_1.get("status") == "failed":
-                return phase_1.get("message")
+            if phase_1.get("status") in ["error", "failed"]:
+               return phase_1.get("message")
         
             return await _execute_github(node_data, integrations, context)
         
@@ -1387,7 +1387,7 @@ async def execute_devflow_phase_one(repo: str, token: str, raw_prompt: str, http
     # 3. Safely extract files (only if repo_snapshot is a list of dictionaries)
     repo_files = []
     if isinstance(repo_snapshot, list):
-        repo_files = [item.get('file') for item in repo_snapshot if isinstance(item, dict) and 'file' in item]
+        repo_files = repo_snapshot["files"]
     
     # 4. Parse intent with the verified file list
     intent = parse_intent(clean_prompt, repo_files=repo_files)
