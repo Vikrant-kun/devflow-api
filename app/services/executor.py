@@ -432,7 +432,10 @@ Rules:
         ]
 
         if not plan["target_files"]:
-            plan["target_files"]=[code_files[0]]
+            return {
+                "status": "failed",
+        "message": "Planner could not determine a valid target file."
+            }
 
         return plan
 
@@ -479,11 +482,17 @@ INVALID
 
 # ── AI Code Edit executor ────────────────────────────────────────────────────
 async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: dict) -> str:
+    selected_files = node_data.get("selected_files", [])
+    forced_file = selected_files[0]["path"] if selected_files else None
     token = integrations.get("github_token")
     repo = integrations.get("selected_repo_full_name")
     raw_prompt = (node_data.get("description") or node_data.get("label") or "").strip()
-    
-    # In a real app, pull the actual user email from your DB. Using a placeholder for now.
+    selected_files = node_data.get("selected_files", [])
+    forced_file = None
+    if selected_files:
+        forced_file = selected_files[0]["path"]
+
+ # In a real app, pull the actual user email from your DB. Using a placeholder for now.
     user_email = "devflow-user@example.com" 
     user_id = context.get("user_id", "system")
 
@@ -493,6 +502,8 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
     client = get_http_client()
 
     # --- PHASE 1: THE GATEKEEPER ---
+    if forced_file:
+         raw_prompt = f"{raw_prompt}\n\nTarget file: {forced_file}"
     phase_1 = await execute_devflow_phase_one(repo, token, raw_prompt, client)
     if phase_1.get("status") == "error":
         return f"Phase 1 Error: {phase_1.get('message')}"
@@ -525,15 +536,26 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
     trimmed_context = await execute_devflow_phase_two_c(clean_prompt, target_files, ast_index, file_contents_map)
 
     # --- PHASE 3: THE AI SURGEON ---
-    execution_plan = await execute_devflow_phase_three_a(clean_prompt, trimmed_context, _groq_request)
+    if forced_file:
+        execution_plan = {
+            "target_file": forced_file,
+            "action_type": "modify"
+        }
+    else:
+        execution_plan = await execute_devflow_phase_three_a(clean_prompt, trimmed_context, _groq_request)
     if execution_plan.get("status") == "failed":
         return execution_plan.get("message")
+    if execution_plan["target_file"] not in snapshot["files"]:
+        return {
+            "status": "failed",
+            "message": f"AI attempted to modify unknown file: {execution_plan['target_file']}"
+        }
 
     surgeon_result = await execute_devflow_phase_three_b(execution_plan, file_contents_map, _groq_request)
     if surgeon_result.get("status") == "failed":
         return surgeon_result.get("message")
 
-    target_file = surgeon_result["target_file"]
+    target_file = forced_file if forced_file else surgeon_result["target_file"]
     fixed_code = surgeon_result["fixed_code"]
 
     # --- PHASE 4: EXECUTION & SHIELD LOOP ---
@@ -1383,11 +1405,24 @@ async def execute_devflow_phase_one(repo: str, token: str, raw_prompt: str, http
 
     # 2. Now, sanitize the prompt
     clean_prompt = sanitize_prompt(raw_prompt)
+
+    # ── GHOST FILE DETECTION ─────────────────────────────
+    repo_files = repo_snapshot.get("files", [])
+
+    file_match = re.findall(r'[\w\/\.-]+\.[a-zA-Z]+', clean_prompt)
+
+    missing_files = [f for f in file_match if f not in repo_files]
+
+    if missing_files:
+        return {
+            "status": "failed",
+            "message": f"❌ File not found in repository: {missing_files[0]}"
+        }
     
     # 3. Safely extract files (only if repo_snapshot is a list of dictionaries)
     repo_files = []
     if isinstance(repo_snapshot, list):
-        repo_files = repo_snapshot["files"]
+        repo_files = repo_snapshot.get("files", [])
     
     # 4. Parse intent with the verified file list
     intent = parse_intent(clean_prompt, repo_files=repo_files)
