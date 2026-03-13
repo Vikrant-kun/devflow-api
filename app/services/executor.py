@@ -561,6 +561,19 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
             "message": f"AI attempted to modify unknown file: {execution_plan['target_file']}"
         }
 
+    target_file = execution_plan["target_file"]
+    original_code = file_contents_map.get(target_file, "")
+
+    ast_data = extract_ast_data(target_file, original_code)
+    functions = ast_data.get("functions", [])
+    requested_funcs = re.findall(r'\b[a-zA-Z_]\w*\(', clean_prompt)
+    missing = [f for f in requested_funcs if f not in functions]
+    if missing:
+        return {
+            "status": "failed",
+            "message": f"❌ Function '{missing[0]}' not found in {target_file}"
+        }
+
     surgeon_result = await execute_devflow_phase_three_b(execution_plan, file_contents_map, _groq_request)
     if surgeon_result.get("status") == "failed":
         return surgeon_result.get("message")
