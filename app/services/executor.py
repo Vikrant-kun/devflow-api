@@ -484,6 +484,9 @@ INVALID
 async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: dict) -> str:
     selected_files = context.get("selected_files") or node_data.get("selected_files") or []
 
+    if original_code.strip() == fixed_code.strip():
+        return "✅ No issues found — no changes needed"
+
     forced_file = None
     if selected_files:
         first = selected_files[0]
@@ -507,7 +510,7 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
     # --- PHASE 1: THE GATEKEEPER ---
     if forced_file:
          raw_prompt = f"{raw_prompt}\n\nTarget file: {forced_file}"
-         
+
     phase_1 = await execute_devflow_phase_one(repo, token, raw_prompt, client)
     if phase_1.get("status") != "success":
         raise Exception(phase_1.get("message"))
@@ -595,8 +598,10 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
             current_code=fixed_code, 
             repo_snapshot=snapshot, 
             workspace_dir=workspace_dir, 
-            http_client=client
+            http_client=client,
+            
         )
+        sandbox_result["original_code"] = surgeon_result.get("original_code", original_code)
     else:
         sandbox_result = shield_status # Pass the failure forward
 
@@ -624,6 +629,18 @@ async def _evaluate_condition(condition: str, parent_output: str) -> bool:
     if "✅ Fixed and committed" in parent_output or "Successfully fixed" in parent_output:
         if condition == "no_errors": return True # 
         if condition == "errors_found": return False # 
+
+    if "NO_ERRORS:" in parent_output:
+        if condition == "no_errors":
+            return True
+        if condition == "errors_found":
+            return False
+
+    if "ERRORS_FOUND:" in parent_output:
+        if condition == "errors_found":
+            return True
+        if condition == "no_errors":
+            return False
 
     prompt = f"""You are a workflow condition evaluator.
     Parent node output: "{parent_output}"
@@ -880,9 +897,20 @@ async def _execute_ai(node_data: dict, context: dict, integrations: dict) -> str
     model = node_data.get("model", "groq")
 
     prompt = f"""You are an AI step in a workflow pipeline.
-Previous step output: {parent_output or 'None'}
-Your task: {description or label}
-Respond with a concise, actionable result (2-4 sentences max)."""
+
+    Task:
+    {description or label}
+
+    Rules:
+    - If code has issues, respond with:
+    ERRORS_FOUND: <short explanation>
+
+    - If code is clean, respond with:
+    NO_ERRORS: Code is clean.
+
+    Previous step output:
+    {parent_output or 'None'}
+    """
 
     client = get_http_client()
     if model == "gpt4" and settings.OPENAI_API_KEY:
@@ -1525,6 +1553,28 @@ async def execute_devflow_phase_three_b(execution_plan: dict, file_contents_map:
     if not original_code and execution_plan.get("action_type") != "create":
         return {"status": "failed", "message": f"Target file {target_file} is empty or missing."}
 
+    import re
+
+    # --- FUNCTION EXISTENCE GUARD ---
+    instruction = execution_plan.get("instruction") or execution_plan.get("focus") or ""
+    requested_functions = re.findall(
+        r'\b([a-zA-Z_]\w*)\s*\(',
+        execution_plan.get("instruction", "")
+    )
+
+    if requested_functions:
+        ast_data = extract_ast_data(target_file, original_code)
+        existing_functions = ast_data.get("functions", [])
+
+        missing = [f for f in requested_functions if f not in existing_functions]
+
+        if missing:
+            return {
+                "status": "failed",
+                "message": f"❌ Function '{missing[0]}' not found in {target_file}"
+            }
+    # --- END GUARD ---
+
     # The Executor writes the actual fix (Heavy AI Call)
     fixed_code = await execute_ai_coder(
         execution_plan=execution_plan,
@@ -1605,6 +1655,12 @@ async def execute_devflow_phase_five(sandbox_result: dict, repo: str, filepath: 
     if sandbox_result["status"] == "success":
         # WIN: Commit the code
         final_code = sandbox_result["final_code"]
+        # Prevent fake commits
+        if final_code.strip() == sandbox_result.get("original_code", "").strip():
+            return {
+            "status": "completed",
+            "message": f"✅ No changes needed for {filepath}"
+        }
         deploy_res = await commit_to_github(repo, filepath, final_code, github_token, http_client)
         
         # Log to PostHog

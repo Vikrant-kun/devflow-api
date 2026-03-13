@@ -152,6 +152,13 @@ Rules:
 - Node descriptions must reference EXACT filenames from the list, not guesses.
 - If SELECTED FILE is provided, all file operations MUST use that path. Do not generate any other file paths{selected_file_hint}
 - If no specific file is mentioned by user, reference the most relevant real file{repo_context}
+
+Edge rules:
+- If a step scans or checks code, it must create two edges:
+  - errors_found → Fix Errors
+  - no_errors → No Errors notification
+- Fix Errors should ONLY run when errors_found
+- Success notification should run only when no_errors
 """
 
     async with httpx.AsyncClient() as client:
