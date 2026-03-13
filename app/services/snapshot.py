@@ -32,11 +32,23 @@ async def build_repo_snapshot(repo: str, token: str, http_client) -> dict:
     }
     
     # Fetch the entire repository tree recursively
-    tree_url = f"https://api.github.com/repos/{repo}/git/trees/recursive=1"
+    repo_meta = await http_client.get(
+        f"https://api.github.com/repos/{repo}",
+        headers=headers,
+        timeout=15.0
+    )
+
+    if repo_meta.status_code != 200:
+        raise Exception(f"Snapshot Failed: Cannot access repo {repo}. Status: {repo_meta.status_code}")
+
+    default_branch = repo_meta.json().get("default_branch", "main")
+
+    tree_url = f"https://api.github.com/repos/{repo}/git/trees/{default_branch}?recursive=1"
+
     res = await http_client.get(tree_url, headers=headers, timeout=15.0)
-    
+
     if res.status_code != 200:
-        raise Exception(f"Snapshot Failed: Cannot access repo {repo}. Status: {res.status_code}")
+        raise Exception(f"Snapshot Failed: Cannot fetch repo tree. Status: {res.status_code}")
 
     tree = res.json().get("tree", [])
     
@@ -46,6 +58,9 @@ async def build_repo_snapshot(repo: str, token: str, http_client) -> dict:
         "extensions": {},      # Mapped by extension (e.g., {".js": ["auth.js"]})
         "folders": {}          # Mapped by directory (e.g., {"src/components": ["button.tsx"]})
     }
+
+    if not tree:
+        raise Exception("Snapshot Failed: Repository tree is empty")
 
     # Allowed extensions to prevent scanning images, videos, or lockfiles
     valid_exts = (".py", ".js", ".jsx", ".ts", ".tsx", ".css", ".html", ".json", ".md", ".c", ".cpp", ".h", ".go", ".rs")

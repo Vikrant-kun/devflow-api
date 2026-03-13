@@ -508,8 +508,8 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
     if forced_file:
          raw_prompt = f"{raw_prompt}\n\nTarget file: {forced_file}"
     phase_1 = await execute_devflow_phase_one(repo, token, raw_prompt, client)
-    if phase_1.get("status") == "error":
-        return f"Phase 1 Error: {phase_1.get('message')}"
+    if phase_1.get("status") != "success":
+        raise Exception(phase_1.get("message"))
         
     snapshot = phase_1["snapshot"]
     if forced_file and forced_file not in snapshot["files"]:
