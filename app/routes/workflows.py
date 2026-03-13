@@ -108,6 +108,11 @@ async def generate_workflow(body: GenerateWorkflowRequest, user: dict = Depends(
     # Fetch real repo files
     repo_context = ""
     real_files = []
+    selected_file_hint = ""
+
+    if body.selected_files:
+        selected_file = body.selected_files[0]
+        selected_file_hint = f"\n\nSELECTED FILE (PRIORITY):\n{selected_file}"
     try:
         settings_row = query_one(
             "SELECT github_token, selected_repo_full_name FROM user_settings WHERE user_id = %s",
@@ -140,10 +145,14 @@ async def generate_workflow(body: GenerateWorkflowRequest, user: dict = Depends(
 Rules:
 - First node always trigger
 - Max 8 nodes, labels 2-4 words
+- If SELECTED FILE is provided, ALWAYS use that exact path
+- ONLY use files from REAL FILES list
 - In node descriptions, ONLY reference files that exist in the repo file list below
 - NEVER invent filenames. ONLY use files from the REAL FILES list provided.
 - Node descriptions must reference EXACT filenames from the list, not guesses.
-- If no specific file is mentioned by user, reference the most relevant real file{repo_context}"""
+- If SELECTED FILE is provided, all file operations MUST use that path. Do not generate any other file paths{selected_file_hint}
+- If no specific file is mentioned by user, reference the most relevant real file{repo_context}
+"""
 
     async with httpx.AsyncClient() as client:
         res = await client.post(
