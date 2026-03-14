@@ -484,35 +484,57 @@ INVALID
 async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: dict) -> str:
     selected_files = context.get("selected_files") or node_data.get("selected_files") or []
 
-    # --- MULTI-FILE SUPPORT ---
-    if len(selected_files) > 1:
-        results = []
-        for file_entry in selected_files:
-            forced_file = file_entry.get("path") if isinstance(file_entry, dict) else file_entry
-            if not forced_file:
-                continue
-            # Run the single-file pipeline for each file
+    if not selected_files:
+        raise Exception("No files selected. Please select at least one file from the repo panel.")
+
+    # Extract all file paths
+    file_paths = []
+    for f in selected_files:
+        path = f.get("path") if isinstance(f, dict) else f
+        if path:
+            file_paths.append(path)
+
+    if not file_paths:
+        raise Exception("No valid file paths found in selected files.")
+
+    # If only one file, run directly and return result
+    if len(file_paths) == 1:
+        return await _execute_single_file_edit(
+            forced_file=file_paths[0],
+            node_data=node_data,
+            integrations=integrations,
+            context=context
+        )
+
+    # If multiple files, run pipeline for each and aggregate results
+    results = []
+    errors = []
+
+    for filepath in file_paths:
+        try:
             result = await _execute_single_file_edit(
-                forced_file=forced_file,
+                forced_file=filepath,
                 node_data=node_data,
                 integrations=integrations,
                 context=context
             )
-            results.append(f"{forced_file}: {result}")
-        return "\n".join(results)
+            results.append(f"📁 {filepath}:\n{result}")
+        except Exception as e:
+            errors.append(f"📁 {filepath}: ❌ {str(e)}")
 
-    # --- SINGLE FILE (original path) ---
-    forced_file = None
-    if selected_files:
-        first = selected_files[0]
-        forced_file = first.get("path") if isinstance(first, dict) else first
+    all_results = results + errors
+    combined = "\n\n---\n\n".join(all_results)
 
-    return await _execute_single_file_edit(
-        forced_file=forced_file,
-        node_data=node_data,
-        integrations=integrations,
-        context=context
+    # Preserve ERRORS_FOUND / NO_ERRORS signals for edge condition evaluation
+    has_errors = any(
+        "ERRORS_FOUND" in r or "❌" in r or "failed" in r.lower()
+        for r in all_results
     )
+
+    if has_errors:
+        return f"ERRORS_FOUND: Issues detected across files.\n\n{combined}"
+    else:
+        return f"NO_ERRORS: All files look clean.\n\n{combined}"
 
 async def _execute_single_file_edit(forced_file: str | None, node_data: dict, integrations: dict, context: dict) -> str:
     token = integrations.get("github_token")
