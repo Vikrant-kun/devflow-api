@@ -16,6 +16,7 @@ from app.services.bm25_engine import rank_and_retrieve_files
 from app.services.ast_engine import trim_code_context
 from app.services.ai_surgeon import execute_ai_planner
 from app.services.ai_surgeon import execute_ai_coder
+from app.services.ai_surgeon import execute_ai_scanner
 from app.services.shield_loop import local_syntax_check, detect_manifest
 from app.services.sandbox import execute_docker_sandbox
 from app.services.free_retry import execute_free_retry
@@ -543,9 +544,13 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
 
     # --- PHASE 3: THE AI SURGEON ---
     if forced_file:
+        prompt_lower = clean_prompt.lower()
+        is_scan = any(w in prompt_lower for w in [
+            "scan", "check", "inspect", "analyze", "analyse", "review", "audit", "find error", "find bug"
+        ])
         execution_plan = {
             "target_file": forced_file,
-            "action_type": "modify"
+            "action_type": "scan" if is_scan else "modify"
         }
     else:
         execution_plan = await execute_devflow_phase_three_a(
@@ -606,6 +611,15 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
             "status": "failed",
             "message": f"❌ Function '{missing[0]}' not found in {target_file}"
         }
+
+    # --- SCAN MODE: report only, no commit, no code changes ---
+    if execution_plan.get("action_type") == "scan":
+        scan_report = await execute_ai_scanner(
+            execution_plan=execution_plan,
+            original_file_content=original_code,
+            _groq_request_func=_groq_request
+        )
+        return scan_report
 
     # --- RUN AI CODE SURGEON ---
     surgeon_result = await execute_devflow_phase_three_b(
@@ -786,21 +800,22 @@ async def _execute_node(node_type: str, node_data: dict, user_id: str, integrati
                 "✅ No issues found" in ancestor_text or
                 "no issues found" in ancestor_text.lower() or
                 "no changes needed" in ancestor_text.lower() or
-                "✅ no" in ancestor_text.lower()
+                "✅ no" in ancestor_text.lower() or
+                "NO_ERRORS:" in ancestor_text
             )
+            code_had_errors = "ERRORS_FOUND:" in ancestor_text
 
-            # Use AI to decide if this is an error email or success email
             node_text = (label + " " + description).lower()
             is_error_email = any(k in node_text for k in ["error", "alert", "fail", "problem", "issue", "bug"])
             is_no_error_email = any(k in node_text for k in ["success", "all clear", "no issue", "clean", "passed", "succeeded"])
 
             if is_error_email and not is_no_error_email:
-                if code_was_clean and not code_was_fixed:
+                if code_was_clean and not code_had_errors:
                     return f"⏭️ Skipped '{label}' — no errors found"
                 return await _execute_email(node_data, context)
 
             elif is_no_error_email and not is_error_email:
-                if code_was_fixed and not code_was_clean:
+                if code_had_errors and not code_was_clean:
                     return f"⏭️ Skipped '{label}' — errors were found"
                 return await _execute_email(node_data, context)
 
