@@ -484,9 +484,6 @@ INVALID
 async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: dict) -> str:
     selected_files = context.get("selected_files") or node_data.get("selected_files") or []
 
-    if original_code.strip() == fixed_code.strip():
-        return "✅ No issues found — no changes needed"
-
     forced_file = None
     if selected_files:
         first = selected_files[0]
@@ -597,7 +594,13 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
     ast_data = extract_ast_data(target_file, original_code)
     functions = ast_data.get("functions", [])
 
-    requested_funcs = re.findall(r'\b([a-zA-Z_]\w*)\s*\(', clean_prompt)
+    requested_funcs = re.findall(
+    r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(',
+    clean_prompt
+    )
+    ignore = {"if","for","while","switch","catch","return"}
+
+    requested_funcs = [f for f in requested_funcs if f not in ignore]
 
     missing = [f for f in requested_funcs if f not in functions]
 
@@ -1511,9 +1514,7 @@ async def execute_devflow_phase_one(repo: str, token: str, raw_prompt: str, http
         }
     
     # 3. Safely extract files (only if repo_snapshot is a list of dictionaries)
-    repo_files = []
-    if isinstance(repo_snapshot, list):
-        repo_files = repo_snapshot.get("files", [])
+    repo_files = repo_snapshot.get("files", [])
     
     # 4. Parse intent with the verified file list
     intent = parse_intent(clean_prompt, repo_files=repo_files)
