@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Any, Optional
+from typing import Any, Optional, List
 
 class WorkflowSnapshot(BaseModel):
     title: str
@@ -21,3 +21,4 @@ class SaveWorkflowRequest(BaseModel):
 class GenerateWorkflowRequest(BaseModel):
     prompt: str
     model: Optional[str] = "groq"
+    selected_files: Optional[List[Any]] = []
