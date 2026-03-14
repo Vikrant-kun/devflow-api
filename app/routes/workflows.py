@@ -5,6 +5,7 @@ from app.auth import get_current_user
 from app.database import query, query_one
 from app.models.workflow import SaveWorkflowRequest, RunWorkflowRequest, GenerateWorkflowRequest
 from app.services.executor import execute_workflow
+from app.services.parser import sanitize_prompt, parse_intent  # ← FIX 5: was missing
 from app.config import settings
 import re
 
@@ -63,12 +64,12 @@ async def delete_all_workflows(user: dict = Depends(get_current_user)):
 @router.post("/run")
 async def run_workflow(body: RunWorkflowRequest, user: dict = Depends(get_current_user)):
     raw_prompt = getattr(body.snapshot, "prompt", "")
-    
+
     # Phase 1: Clean and Parse (Zero AI Cost)
     clean_prompt = sanitize_prompt(raw_prompt)
     intent = parse_intent(clean_prompt)
-    
-    # Fast-Fail Logic: If the FSM has absolutely no idea what to do, reject it.
+
+    # Fast-Fail Logic
     if intent["action"] == "unknown" and intent["target"] == "unknown":
         return {
             "status": "failed",
@@ -76,19 +77,14 @@ async def run_workflow(body: RunWorkflowRequest, user: dict = Depends(get_curren
             "logs": []
         }
 
-    # Pass the clean prompt and intent into the execution context
+    # FIX 4: Only call execute_workflow once with the correct context
     result = await execute_workflow(
         nodes=body.snapshot.nodes,
         edges=body.snapshot.edges,
         user_id=user["user_id"],
         context={"prompt": clean_prompt, "intent": intent}
     )
-    result = await execute_workflow(
-        nodes=body.snapshot.nodes,
-        edges=body.snapshot.edges,
-        user_id=user["user_id"],
-        context={"prompt": prompt_val}
-    )
+
     run_row = query_one(
         """INSERT INTO workflow_runs (user_id, workflow_id, workflow_name, status, started_at, duration, triggered_by, snapshot, logs)
            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *""",
@@ -105,14 +101,27 @@ async def run_workflow(body: RunWorkflowRequest, user: dict = Depends(get_curren
 
 @router.post("/generate")
 async def generate_workflow(body: GenerateWorkflowRequest, user: dict = Depends(get_current_user)):
+
+    # FIX 1: Hard block — if no file selected, reject immediately
+    if not body.selected_files:
+        raise HTTPException(
+            status_code=400,
+            detail="⚠️ Please select a file from your repository before generating a pipeline."
+        )
+
+    # FIX 2: Extract the path string correctly, not the whole dict
+    selected_file = body.selected_files[0]
+    if isinstance(selected_file, dict):
+        selected_file_path = selected_file.get("path") or selected_file.get("name") or ""
+    else:
+        selected_file_path = str(selected_file)
+
+    selected_file_hint = f"\n\nSELECTED FILE (YOU MUST USE THIS EXACT PATH — NO EXCEPTIONS): {selected_file_path}"
+
     # Fetch real repo files
     repo_context = ""
     real_files = []
-    selected_file_hint = ""
 
-    if body.selected_files:
-        selected_file = body.selected_files[0]
-        selected_file_hint = f"\n\nSELECTED FILE (PRIORITY):\n{selected_file}"
     try:
         settings_row = query_one(
             "SELECT github_token, selected_repo_full_name FROM user_settings WHERE user_id = %s",
@@ -126,7 +135,6 @@ async def generate_workflow(body: GenerateWorkflowRequest, user: dict = Depends(
                     f"https://api.github.com/repos/{repo}/git/trees/HEAD?recursive=1",
                     headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
                 )
-
                 if tree_res.status_code == 200:
                     files = [
                         f["path"] for f in tree_res.json().get("tree", [])
@@ -135,7 +143,7 @@ async def generate_workflow(body: GenerateWorkflowRequest, user: dict = Depends(
                         and not any(s in f["path"] for s in ["node_modules/", "dist/", "build/", ".min."])
                     ]
                     real_files = files
-                    repo_context = f"\n\nREPO: {repo}\nREAL FILES (use ONLY these in node descriptions):\n" + "\n".join(files[:50])
+                    repo_context = f"\n\nREPO: {repo}\nREAL FILES (use ONLY these — never invent paths):\n" + "\n".join(files[:50])
     except Exception as e:
         print(f"repo_context failed: {e}")
 
@@ -145,13 +153,10 @@ async def generate_workflow(body: GenerateWorkflowRequest, user: dict = Depends(
 Rules:
 - First node always trigger
 - Max 8 nodes, labels 2-4 words
-- If SELECTED FILE is provided, ALWAYS use that exact path
-- ONLY use files from REAL FILES list
-- In node descriptions, ONLY reference files that exist in the repo file list below
-- NEVER invent filenames. ONLY use files from the REAL FILES list provided.
-- Node descriptions must reference EXACT filenames from the list, not guesses.
-- If SELECTED FILE is provided, all file operations MUST use that path. Do not generate any other file paths{selected_file_hint}
-- If no specific file is mentioned by user, reference the most relevant real file{repo_context}
+- SELECTED FILE is mandatory — every file operation node MUST use exactly: {selected_file_path}
+- NEVER invent or guess any filename. Only use files from REAL FILES list.
+- If a filename is needed and it is not in REAL FILES, use the SELECTED FILE path.
+- Node descriptions must contain ONLY filenames that exist in the REAL FILES list below.{selected_file_hint}{repo_context}
 
 Edge rules:
 - If a step scans or checks code, it must create two edges:
@@ -167,7 +172,10 @@ Edge rules:
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {settings.GROQ_API_KEY}"},
             json={
                 "model": "llama-3.3-70b-versatile",
-                "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": body.prompt}],
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": body.prompt}
+                ],
                 "max_tokens": 1024,
                 "temperature": 0.2,
                 "top_p": 0.9
@@ -176,23 +184,23 @@ Edge rules:
         )
     if res.status_code != 200:
         raise HTTPException(status_code=502, detail=f"Groq error: {res.status_code}")
+
     raw = res.json()["choices"][0]["message"]["content"].replace("```json", "").replace("```", "").strip()
     try:
         data = json.loads(raw)
-        
+
+        # FIX 3: Replace hallucinated filenames with the actual selected file, not empty string
         valid_files = set(real_files)
-        if valid_files:
+        if valid_files and selected_file_path:
             nodes = data.get("nodes", [])
             for node in nodes:
                 desc = node.get("description", "")
-                matches = re.findall(r"[a-zA-Z0-9_/.-]+\.(?:js|py|ts|jsx|tsx)", desc)
+                matches = re.findall(r"[a-zA-Z0-9_/.-]+\.(?:js|py|ts|jsx|tsx|css|html|json)", desc)
                 for f in matches:
                     if f not in valid_files:
-                        desc = desc.replace(f, "")
-                node["description"] = desc
+                        desc = desc.replace(f, selected_file_path)
+                node["description"] = desc.strip()
 
         return data
-    except:
+    except Exception:
         raise HTTPException(status_code=422, detail="Failed to parse AI response")
-
-        
