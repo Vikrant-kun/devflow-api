@@ -556,13 +556,31 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
         }
     else:
         execution_plan = await execute_devflow_phase_three_a(clean_prompt, trimmed_context, _groq_request)
-    if execution_plan.get("status") == "failed":
-        return execution_plan.get("message")
-    if execution_plan["target_file"] not in snapshot["files"]:
-        return {
-            "status": "failed",
-            "message": f"AI attempted to modify unknown file: {execution_plan['target_file']}"
-        }
+        valid_files = snapshot.get("files", [])
+
+    target_file = execution_plan.get("target_file")
+
+    # If AI hallucinated a file, try matching closest real file
+    if target_file not in valid_files:
+        
+        import difflib
+        
+        match = difflib.get_close_matches(target_file, valid_files, n=1, cutoff=0.6)
+
+        if match:
+            execution_plan["target_file"] = match[0]
+        else:
+            return {
+                "status": "failed",
+                "message": f"❌ File '{target_file}' not found in repository."
+            }
+        if execution_plan.get("status") == "failed":
+            return execution_plan.get("message")
+        if execution_plan["target_file"] not in snapshot["files"]:
+            return {
+                "status": "failed",
+                "message": f"AI attempted to modify unknown file: {execution_plan['target_file']}"
+            }
 
     target_file = execution_plan["target_file"]
     original_code = file_contents_map.get(target_file, "")
@@ -1559,7 +1577,7 @@ async def execute_devflow_phase_three_b(execution_plan: dict, file_contents_map:
     instruction = execution_plan.get("instruction") or execution_plan.get("focus") or ""
     requested_functions = re.findall(
         r'\b([a-zA-Z_]\w*)\s*\(',
-        execution_plan.get("instruction", "")
+       instruction
     )
 
     if requested_functions:
