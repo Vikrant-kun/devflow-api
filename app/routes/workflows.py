@@ -159,12 +159,12 @@ Rules:
 - Node descriptions must contain ONLY filenames that exist in the REAL FILES list below.{selected_file_hint}{repo_context}
 
 Edge rules:
-- If a step scans or checks code, it must create two edges:
-  - errors_found → Fix Errors
-  - no_errors → No Errors notification
-- Fix Errors should ONLY run when errors_found
-- Success notification should run only when no_errors
-"""
+- If the user wants to SCAN or CHECK code (not fix), create ONE scan action node with description starting with "Scan [filename] for errors". Then create TWO edges from it:
+  - condition "errors_found" → notification node that sends error report email
+  - condition "no_errors" → notification node that sends all-clear email
+- NEVER create a "Fix" action node for scan requests. Scan = read and report only.
+- "Fix" or "modify" action nodes are ONLY for when user explicitly says fix/update/modify/refactor.
+- The scan node description MUST start with the word "Scan". Never "Fix"."""
 
     async with httpx.AsyncClient() as client:
         res = await client.post(
