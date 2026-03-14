@@ -484,18 +484,42 @@ INVALID
 async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: dict) -> str:
     selected_files = context.get("selected_files") or node_data.get("selected_files") or []
 
+    # --- MULTI-FILE SUPPORT ---
+    if len(selected_files) > 1:
+        results = []
+        for file_entry in selected_files:
+            forced_file = file_entry.get("path") if isinstance(file_entry, dict) else file_entry
+            if not forced_file:
+                continue
+            # Run the single-file pipeline for each file
+            result = await _execute_single_file_edit(
+                forced_file=forced_file,
+                node_data=node_data,
+                integrations=integrations,
+                context=context
+            )
+            results.append(f"{forced_file}: {result}")
+        return "\n".join(results)
+
+    # --- SINGLE FILE (original path) ---
     forced_file = None
     if selected_files:
         first = selected_files[0]
-        if isinstance(first, dict):
-            forced_file = first.get("path")
-        else:
-            forced_file = first
+        forced_file = first.get("path") if isinstance(first, dict) else first
+
+    return await _execute_single_file_edit(
+        forced_file=forced_file,
+        node_data=node_data,
+        integrations=integrations,
+        context=context
+    )
+
+async def _execute_single_file_edit(forced_file: str | None, node_data: dict, integrations: dict, context: dict) -> str:
     token = integrations.get("github_token")
     repo = integrations.get("selected_repo_full_name")
     raw_prompt = (node_data.get("description") or node_data.get("label") or "").strip()
 
- # In a real app, pull the actual user email from your DB. Using a placeholder for now.
+    # In a real app, pull the actual user email from your DB. Using a placeholder for now.
     user_email = "devflow-user@example.com" 
     user_id = context.get("user_id", "system")
 
@@ -596,20 +620,24 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
     ast_data = extract_ast_data(target_file, original_code)
     functions = ast_data.get("functions", [])
 
+    # ← ADD THIS: extract just the names from the dicts
+    function_names = [f["name"] for f in functions if f.get("name")]
+
     requested_funcs = re.findall(
-    r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(',
-    clean_prompt
+        r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(',
+        clean_prompt
     )
-    ignore = {"if","for","while","switch","catch","return"}
+    ignore = {"if", "for", "while", "switch", "catch", "return", "JSON", "console",
+              "document", "window", "Object", "Array", "Promise", "parseInt", "parseFloat"}
 
     requested_funcs = [f for f in requested_funcs if f not in ignore]
 
-    missing = [f for f in requested_funcs if f not in functions]
+    missing = [f for f in requested_funcs if f not in function_names]  # ← use function_names
 
     if missing:
         return {
             "status": "failed",
-            "message": f"❌ Function '{missing[0]}' not found in {target_file}"
+            "message": f"❌ Function '{missing[0]}' not found in {target_file}. Available functions: {', '.join(function_names[:10])}"
         }
 
     # --- SCAN MODE: report only, no commit, no code changes ---

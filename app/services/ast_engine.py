@@ -33,10 +33,23 @@ def extract_ast_data(file_path: str, content: str) -> dict:
     functions = []
     imports = []
     
+    def get_node_name(node, source: str) -> str:
+        """Extract function name from AST node across all languages."""
+        # Look for an 'identifier' child — works for JS, Python, TS, Go, Rust
+        for child in node.children:
+            if child.type == "identifier":
+                return source[child.start_byte:child.end_byte]
+            # JS: property_identifier for methods
+            if child.type == "property_identifier":
+                return source[child.start_byte:child.end_byte]
+        return ""
+    
     def traverse(node):
         # Universal catch for functions, methods, and declarations
         if any(keyword in node.type for keyword in ["function", "method", "class_definition"]):
+            name = get_node_name(node, content)
             functions.append({
+                "name": name,  # ← NOW WE STORE THE NAME
                 "type": node.type,
                 "start_line": node.start_point[0],
                 "end_line": node.end_point[0]
