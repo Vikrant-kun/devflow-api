@@ -17,7 +17,6 @@ from app.services.ast_engine import trim_code_context
 from app.services.ai_surgeon import execute_ai_planner
 from app.services.ai_surgeon import execute_ai_coder
 from app.services.shield_loop import local_syntax_check, detect_manifest
-from app.services.shield_loop import local_syntax_check, detect_manifest
 from app.services.sandbox import execute_docker_sandbox
 from app.services.free_retry import execute_free_retry
 from app.services.deployment import commit_to_github, send_fallback_email, log_observability_event
@@ -505,10 +504,7 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
     client = get_http_client()
 
     # --- PHASE 1: THE GATEKEEPER ---
-    if forced_file:
-         raw_prompt = f"{raw_prompt}\n\nTarget file: {forced_file}"
-
-    phase_1 = await execute_devflow_phase_one(repo, token, raw_prompt, client)
+    phase_1 = await execute_devflow_phase_one(repo, token, raw_prompt, client, forced_file=forced_file)
     if phase_1.get("status") != "success":
         raise Exception(phase_1.get("message"))
         
@@ -568,9 +564,10 @@ async def _execute_ai_code_edit(node_data: dict, integrations: dict, context: di
 
     if target_file not in valid_files:
 
-        match = difflib.get_close_matches(target_file, valid_files, n=1, cutoff=0.6)
+        match = difflib.get_close_matches(target_file, valid_files, n=1, cutoff=0.85)
 
         if match:
+            print(f"[WARN] Hallucination guard: AI target '{target_file}' not found. Substituting with closest match: '{match[0]}'")
             execution_plan["target_file"] = match[0]
             target_file = match[0]
         else:
@@ -1482,7 +1479,7 @@ DESCRIPTION: <2-3 sentence description of changes>"""
         
         raise Exception(f"PR creation failed: {create_res.json().get('message')}")
     
-async def execute_devflow_phase_one(repo: str, token: str, raw_prompt: str, http_client):
+async def execute_devflow_phase_one(repo: str, token: str, raw_prompt: str, http_client, forced_file: str = None):
     try:
         # 1. Fetch the context
         repo_snapshot = await build_repo_snapshot(repo, token, http_client)
@@ -1501,6 +1498,9 @@ async def execute_devflow_phase_one(repo: str, token: str, raw_prompt: str, http
     repo_files = repo_snapshot.get("files", [])
 
     file_match = re.findall(r'[\w\/\.-]+\.[a-zA-Z]+', clean_prompt)
+
+    if forced_file:
+        file_match = [f for f in file_match if f != forced_file and f != forced_file.split('/')[-1]]
 
     missing_files = [
         f for f in file_match
