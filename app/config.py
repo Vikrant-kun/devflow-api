@@ -5,7 +5,7 @@ class Settings(BaseSettings):
     CLERK_SECRET_KEY: str
     GROQ_API_KEY: str
     BREVO_API_KEY: str 
-    FRONTEND_URL: str = "http://localhost:5173"
+    FRONTEND_URL: str = ""
     OPENAI_API_KEY: str = ""
     GEMINI_API_KEY: str = ""
     GMAIL_USER: str = ""
