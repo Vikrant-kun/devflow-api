@@ -56,13 +56,13 @@ async def github_request(client, method, url, headers=None, **kwargs):
     return res
 
 
-def get_github_token(user: dict) -> str:
+def get_github_token(user: dict) -> str | None:
     row = query_one(
         "SELECT github_token FROM user_settings WHERE user_id = %s",
         (user["user_id"],)
     )
     if not row or not row.get("github_token"):
-        raise HTTPException(status_code=401, detail="GitHub not connected. Please reconnect your GitHub account.")
+        return None
     return row["github_token"]
 
 
@@ -167,6 +167,8 @@ async def list_repos(user: dict = Depends(get_current_user)):
         return {"repos": cached[1]}
 
     token = get_github_token(user)
+    if not token:
+        return {"repos": []}  # ← return empty instead of 500
     client = get_github_client()
 
     res = await github_request(
@@ -203,6 +205,8 @@ async def list_repos(user: dict = Depends(get_current_user)):
 async def create_repo(body: CreateRepoRequest, user: dict = Depends(get_current_user)):
 
     token = get_github_token(user)
+    if not token:
+        raise HTTPException(status_code=400, detail="GitHub not connected. Please connect your GitHub account.")
     client = get_github_client()
 
     res = await github_request(
@@ -242,6 +246,8 @@ async def create_repo(body: CreateRepoRequest, user: dict = Depends(get_current_
 async def commit_file(body: CommitFileRequest, user: dict = Depends(get_current_user)):
 
     token = get_github_token(user)
+    if not token:
+        raise HTTPException(status_code=400, detail="GitHub not connected. Please connect your GitHub account.")
     client = get_github_client()
 
     encoded_content = base64.b64encode(body.content.encode("utf-8")).decode("utf-8")
@@ -287,6 +293,8 @@ async def commit_file(body: CommitFileRequest, user: dict = Depends(get_current_
 async def delete_repo(owner: str, repo: str, user: dict = Depends(get_current_user)):
 
     token = get_github_token(user)
+    if not token:
+        raise HTTPException(status_code=400, detail="GitHub not connected. Please connect your GitHub account.")
     client = get_github_client()
 
     res = await github_request(
@@ -364,6 +372,8 @@ async def save_integration_settings(data: dict, user=Depends(get_current_user)):
 async def get_branches(user: dict = Depends(get_current_user)):
 
     token = get_github_token(user)
+    if not token:
+        raise HTTPException(status_code=400, detail="GitHub not connected. Please connect your GitHub account.")
 
     repo = query_one(
         "SELECT selected_repo_full_name FROM user_settings WHERE user_id = %s",
