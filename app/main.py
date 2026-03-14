@@ -10,29 +10,25 @@ app = FastAPI(
     redirect_slashes=False
 )
 
-# ── CORS ─────────────────────────────────────────────────────────
+origins = [
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://localhost:3000",
+    "http://localhost:4173",
+    "https://dev-flow-ai-wheat.vercel.app",
+]
+
+if settings.FRONTEND_URL and settings.FRONTEND_URL not in origins:
+    origins.append(settings.FRONTEND_URL)
+
 app.add_middleware(
     CORSMiddleware,
-    origins = [
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "http://localhost:3000",
-        "http://localhost:4173",
-        "https://dev-flow-ai-wheat.vercel.app",
-    ]
-    if settings.FRONTEND_URL and settings.FRONTEND_URL not in origins:
-        origins.append(settings.FRONTEND_URL)
-       
-
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=origins,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
-# ── Routes ───────────────────────────────────────────────────────
+
 app.include_router(health.router)
 app.include_router(workflows.router)
 app.include_router(runs.router)
