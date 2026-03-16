@@ -13,9 +13,10 @@ def get_jwks() -> dict:
     global _jwks_cache
     if _jwks_cache is not None:
         return _jwks_cache
-    resp = httpx.get("https://api.clerk.com/v1/jwks", headers={
-        "Authorization": f"Bearer {settings.CLERK_SECRET_KEY}"
-    }, timeout=10.0)
+    resp = httpx.get(
+    f"{settings.CLERK_ISSUER}/.well-known/jwks.json",
+    timeout=10.0
+)
     resp.raise_for_status()
     _jwks_cache = resp.json()
     return _jwks_cache
