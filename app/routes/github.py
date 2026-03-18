@@ -161,14 +161,16 @@ async def get_user_settings(user: dict = Depends(get_current_user)):
 @router.get("/repos/")
 async def list_repos(user: dict = Depends(get_current_user)):
 
-    cached = _repo_cache.get(user["user_id"])
-
-    if cached and (time.time() - cached[0]) < REPO_CACHE_TTL:
-        return {"repos": cached[1]}
-
     token = get_github_token(user)
+    has_pat = bool(token)
+    
+    cached = _repo_cache.get(user["user_id"])
+    if cached and (time.time() - cached[0]) < REPO_CACHE_TTL:
+        return {"repos": cached[1], "has_pat": has_pat}
+
     if not token:
-        return {"repos": []}  # ← return empty instead of 500
+        return {"repos": [], "has_pat": False}
+    
     client = get_github_client()
 
     res = await github_request(
@@ -195,7 +197,7 @@ async def list_repos(user: dict = Depends(get_current_user)):
 
     _repo_cache[user["user_id"]] = (time.time(), repos_list)
 
-    return {"repos": repos_list}
+    return {"repos": repos_list, "has_pat": has_pat}
 
 
 # -----------------------------
